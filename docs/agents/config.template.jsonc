@@ -1,0 +1,28 @@
+// mcpx config. Comments are allowed (JSONC).
+// Secrets never go in this file: reference them as ${env:NAME} and put the
+// values in the .env file next to this file (or in the real environment).
+//
+// Whitelist rules (per server):
+//   allow           glob patterns of tools that may be listed and called. Empty = nothing.
+//   deny            glob patterns that are always blocked, even if allowed above.
+//   allow_readonly  also allow tools the server itself marks readOnlyHint=true.
+// Run `mcpx policy <server>` to see every tool and the decision for it.
+{
+  "servers": {
+    "github": {
+      "description": "GitHub: repos, issues, pull requests, code search",
+      // GitHub's hosted MCP server. Needs a fine-grained PAT in GITHUB_TOKEN.
+      "url": "https://api.githubcopilot.com/mcp/",
+      "headers": { "Authorization": "Bearer ${env:GITHUB_TOKEN}" },
+      // Alternative: run the server locally with Docker (slower per call: ~1-3 s start-up).
+      // "command": "docker",
+      // "args": ["run", "-i", "--rm", "-e", "GITHUB_PERSONAL_ACCESS_TOKEN", "ghcr.io/github/github-mcp-server"],
+      // "env": { "GITHUB_PERSONAL_ACCESS_TOKEN": "${env:GITHUB_TOKEN}" },
+
+      "allow": ["get_*", "list_*", "search_*"],
+      // To allow a write tool, add its exact name, e.g. "create_issue", "add_issue_comment".
+      "deny": ["delete_*", "merge_*"],
+      "timeout": "60s"
+    }
+  }
+}
