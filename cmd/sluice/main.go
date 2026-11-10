@@ -1,11 +1,11 @@
-// Command mcpx calls MCP servers from the shell so any AI agent (Claude Code,
+// Command sluice calls MCP servers from the shell so any AI agent (Claude Code,
 // Codex, Gemini CLI, ...) or script can use them, behind a per-server whitelist.
 package main
 
 import (
 	"os"
 
-	"github.com/jiawei42/local-mcp/internal/cli"
+	"github.com/jiawei42/sluice/internal/cli"
 )
 
 func main() {

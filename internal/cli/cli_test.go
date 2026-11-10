@@ -14,13 +14,13 @@ import (
 
 	"github.com/modelcontextprotocol/go-sdk/mcp"
 
-	"github.com/jiawei42/local-mcp/internal/fakeserver"
+	"github.com/jiawei42/sluice/internal/fakeserver"
 )
 
 var fakeBin string
 
 func TestMain(m *testing.M) {
-	dir, err := os.MkdirTemp("", "mcpx-test")
+	dir, err := os.MkdirTemp("", "sluice-test")
 	if err != nil {
 		panic(err)
 	}
@@ -28,7 +28,7 @@ func TestMain(m *testing.M) {
 	if runtime.GOOS == "windows" {
 		fakeBin += ".exe"
 	}
-	out, err := exec.Command("go", "build", "-o", fakeBin, "github.com/jiawei42/local-mcp/internal/fakeserver/cmd").CombinedOutput()
+	out, err := exec.Command("go", "build", "-o", fakeBin, "github.com/jiawei42/sluice/internal/fakeserver/cmd").CombinedOutput()
 	if err != nil {
 		panic("building fakeserver: " + err.Error() + "\n" + string(out))
 	}
@@ -177,21 +177,21 @@ func TestHTTPWithHeaderFromEnv(t *testing.T) {
 
 	cfg := writeConfig(t, map[string]any{"web": map[string]any{
 		"url":     ts.URL,
-		"headers": map[string]string{"Authorization": "Bearer ${env:MCPX_TEST_TOKEN}"},
+		"headers": map[string]string{"Authorization": "Bearer ${env:SLUICE_TEST_TOKEN}"},
 		"allow":   []string{"echo"},
 	}})
 
-	os.Unsetenv("MCPX_TEST_TOKEN")
-	if r := runCLI(t, cfg, "", "call", "web", "echo", "-a", "text=x"); r.code != ExitConnect || !strings.Contains(r.err, "MCPX_TEST_TOKEN") {
+	os.Unsetenv("SLUICE_TEST_TOKEN")
+	if r := runCLI(t, cfg, "", "call", "web", "echo", "-a", "text=x"); r.code != ExitConnect || !strings.Contains(r.err, "SLUICE_TEST_TOKEN") {
 		t.Fatalf("missing env: want exit 4 naming the var, got %d %q", r.code, r.err)
 	}
 
-	t.Setenv("MCPX_TEST_TOKEN", "wrong")
+	t.Setenv("SLUICE_TEST_TOKEN", "wrong")
 	if r := runCLI(t, cfg, "", "call", "web", "echo", "-a", "text=x"); r.code != ExitConnect {
 		t.Fatalf("wrong token: want exit 4, got %d %q", r.code, r.err)
 	}
 
-	t.Setenv("MCPX_TEST_TOKEN", "s3cret")
+	t.Setenv("SLUICE_TEST_TOKEN", "s3cret")
 	r := runCLI(t, cfg, "", "call", "web", "echo", "-a", "text=hi")
 	if r.code != 0 || strings.TrimSpace(r.out) != "hi" {
 		t.Fatalf("http call: %d %q %q", r.code, r.out, r.err)
@@ -200,15 +200,15 @@ func TestHTTPWithHeaderFromEnv(t *testing.T) {
 
 func TestDotEnvNextToConfig(t *testing.T) {
 	cfg := defaultCfg(t)
-	os.Unsetenv("MCPX_DOTENV_TEST")
-	os.WriteFile(filepath.Join(filepath.Dir(cfg), ".env"), []byte("# c\nMCPX_DOTENV_TEST=\"hello\"\n"), 0o600)
+	os.Unsetenv("SLUICE_DOTENV_TEST")
+	os.WriteFile(filepath.Join(filepath.Dir(cfg), ".env"), []byte("# c\nSLUICE_DOTENV_TEST=\"hello\"\n"), 0o600)
 	if r := runCLI(t, cfg, "", "servers"); r.code != 0 {
 		t.Fatalf("servers: %d %s", r.code, r.err)
 	}
-	if got := os.Getenv("MCPX_DOTENV_TEST"); got != "hello" {
+	if got := os.Getenv("SLUICE_DOTENV_TEST"); got != "hello" {
 		t.Fatalf(".env not loaded, got %q", got)
 	}
-	os.Unsetenv("MCPX_DOTENV_TEST")
+	os.Unsetenv("SLUICE_DOTENV_TEST")
 }
 
 func TestUsageErrors(t *testing.T) {
@@ -227,9 +227,9 @@ func TestUsageErrors(t *testing.T) {
 }
 
 func TestInitCreatesLoadableConfig(t *testing.T) {
-	p := filepath.Join(t.TempDir(), "mcpx", "config.json")
+	p := filepath.Join(t.TempDir(), "sluice", "config.json")
 	var out bytes.Buffer
-	if code := Run([]string{"--config", p, "init"}, IO{Out: &out, Err: &out}); code != 0 {
+	if code := Run([]string{"--config", p, "init", "github"}, IO{Out: &out, Err: &out}); code != 0 {
 		t.Fatalf("init: %d %s", code, out.String())
 	}
 	if r := runCLI(t, p, "", "servers"); r.code != 0 || !strings.Contains(r.out, "github") {

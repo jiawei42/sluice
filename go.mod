@@ -1,4 +1,4 @@
-module github.com/jiawei42/local-mcp
+module github.com/jiawei42/sluice
 
 go 1.26.5
 

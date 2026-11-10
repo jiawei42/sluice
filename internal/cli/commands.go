@@ -9,18 +9,22 @@ import (
 	"io"
 	"os"
 	"path/filepath"
+	"runtime"
 	"sort"
 	"strings"
 	"text/tabwriter"
 	"time"
 	"unicode/utf8"
 
+	"github.com/modelcontextprotocol/go-sdk/auth"
 	"github.com/modelcontextprotocol/go-sdk/mcp"
 
-	agentdocs "github.com/jiawei42/local-mcp/docs/agents"
-	"github.com/jiawei42/local-mcp/internal/client"
-	"github.com/jiawei42/local-mcp/internal/config"
-	"github.com/jiawei42/local-mcp/internal/policy"
+	agentdocs "github.com/jiawei42/sluice/docs/agents"
+	"github.com/jiawei42/sluice/internal/audit"
+	"github.com/jiawei42/sluice/internal/client"
+	"github.com/jiawei42/sluice/internal/config"
+	"github.com/jiawei42/sluice/internal/oauth"
+	"github.com/jiawei42/sluice/internal/policy"
 )
 
 func loadConfig(o *opts) (*config.Config, error) {
@@ -62,12 +66,40 @@ func timeoutFor(o *opts, s *config.Server) time.Duration {
 	return s.TimeoutOrDefault()
 }
 
-func connect(ctx context.Context, o *opts, name string, s *config.Server) (*client.Session, error) {
-	sess, err := client.Connect(ctx, name, s, o.verbose)
+// clientOptions wires the non-interactive OAuth handler: stored token only,
+// never a browser login.
+func clientOptions(o *opts, c *config.Config, name string) client.Options {
+	store := oauth.NewStore(c)
+	return client.Options{
+		Verbose: o.verbose,
+		OAuth: func(resolved *config.Server) (auth.OAuthHandler, error) {
+			return oauth.AgentHandler(store, name, resolved)
+		},
+	}
+}
+
+func connect(ctx context.Context, o *opts, c *config.Config, name string, s *config.Server) (*client.Session, error) {
+	sess, err := client.Connect(ctx, name, s, clientOptions(o, c, name))
 	if err != nil {
-		return nil, &ExitError{ExitConnect, err}
+		return nil, &ExitError{ExitConnect, loginHint(err, name, s)}
 	}
 	return sess, nil
+}
+
+// loginHint replaces a noisy transport error with the plain instruction when
+// the real cause is a missing or expired OAuth login.
+func loginHint(err error, name string, s *config.Server) error {
+	if err == nil {
+		return nil
+	}
+	var lr *oauth.LoginRequiredError
+	if errors.As(err, &lr) {
+		return lr
+	}
+	if s.IsOAuth() && (strings.Contains(err.Error(), "401") || strings.Contains(err.Error(), "Unauthorized")) {
+		return &oauth.LoginRequiredError{Server: name}
+	}
+	return err
 }
 
 func asConnectErr(err error) error {
@@ -78,18 +110,18 @@ func asConnectErr(err error) error {
 	return &ExitError{ExitConnect, err}
 }
 
-func deniedErr(c *config.Config, server, tool, reason string) error {
+func deniedErr(s *config.Server, server, tool, reason string) error {
 	return fail(ExitDenied,
 		"tool %s/%s is not allowed by the whitelist (%s). Do not try to work around this; "+
 			"ask the user to add it to \"allow\" for server %q in %s if it is really needed.",
-		server, tool, reason, server, c.Path)
+		server, tool, reason, server, s.Source)
 }
 
 // ---- servers ---------------------------------------------------------------
 
 func cmdServers(o *opts, rest []string, stdio IO) error {
 	if len(rest) != 0 {
-		return fail(ExitUsage, "usage: mcpx servers [--json]")
+		return fail(ExitUsage, "usage: sluice servers [--json]")
 	}
 	c, err := loadConfig(o)
 	if err != nil {
@@ -123,7 +155,7 @@ func cmdServers(o *opts, rest []string, stdio IO) error {
 
 func cmdTools(o *opts, rest []string, stdio IO) error {
 	if len(rest) != 1 {
-		return fail(ExitUsage, "usage: mcpx tools <server> [--json]")
+		return fail(ExitUsage, "usage: sluice tools <server> [--json]")
 	}
 	c, err := loadConfig(o)
 	if err != nil {
@@ -135,7 +167,7 @@ func cmdTools(o *opts, rest []string, stdio IO) error {
 	}
 	ctx, cancel := context.WithTimeout(context.Background(), timeoutFor(o, s))
 	defer cancel()
-	sess, err := connect(ctx, o, rest[0], s)
+	sess, err := connect(ctx, o, c, rest[0], s)
 	if err != nil {
 		return err
 	}
@@ -153,7 +185,7 @@ func cmdTools(o *opts, rest []string, stdio IO) error {
 	}
 	sort.Slice(allowed, func(i, j int) bool { return allowed[i].Name < allowed[j].Name })
 	if len(allowed) == 0 {
-		fmt.Fprintf(stdio.Err, "mcpx: no tools of %q are allowed by the whitelist (%d exist)\n", rest[0], len(all))
+		fmt.Fprintf(stdio.Err, "sluice: no tools of %q are allowed by the whitelist (%d exist)\n", rest[0], len(all))
 	}
 	if o.json {
 		type row struct {
@@ -179,7 +211,7 @@ func cmdTools(o *opts, rest []string, stdio IO) error {
 
 func cmdSchema(o *opts, rest []string, stdio IO) error {
 	if len(rest) != 2 {
-		return fail(ExitUsage, "usage: mcpx schema <server> <tool>")
+		return fail(ExitUsage, "usage: sluice schema <server> <tool>")
 	}
 	c, err := loadConfig(o)
 	if err != nil {
@@ -192,11 +224,11 @@ func cmdSchema(o *opts, rest []string, stdio IO) error {
 	}
 	p := policyOf(s)
 	if d := p.Check(tool, nil); !d.Allowed && !p.NeedsMetadata(tool) {
-		return deniedErr(c, server, tool, d.Reason)
+		return deniedErr(s, server, tool, d.Reason)
 	}
 	ctx, cancel := context.WithTimeout(context.Background(), timeoutFor(o, s))
 	defer cancel()
-	sess, err := connect(ctx, o, server, s)
+	sess, err := connect(ctx, o, c, server, s)
 	if err != nil {
 		return err
 	}
@@ -206,10 +238,10 @@ func cmdSchema(o *opts, rest []string, stdio IO) error {
 		return asConnectErr(err)
 	}
 	if t == nil {
-		return fail(ExitUsage, "server %q has no tool %q (run `mcpx tools %s`)", server, tool, server)
+		return fail(ExitUsage, "server %q has no tool %q (run `sluice tools %s`)", server, tool, server)
 	}
 	if d := p.Check(tool, readOnlyOf(t)); !d.Allowed {
-		return deniedErr(c, server, tool, d.Reason)
+		return deniedErr(s, server, tool, d.Reason)
 	}
 	out := map[string]any{
 		"name":        t.Name,
@@ -232,7 +264,7 @@ func cmdSchema(o *opts, rest []string, stdio IO) error {
 
 func cmdCall(o *opts, rest []string, stdio IO) error {
 	if len(rest) < 2 || len(rest) > 3 {
-		return fail(ExitUsage, "usage: mcpx call <server> <tool> [JSON | - | @file.json] [-a key=value ...]")
+		return fail(ExitUsage, "usage: sluice call <server> <tool> [JSON | - | @file.json] [-a key=value ...]")
 	}
 	c, err := loadConfig(o)
 	if err != nil {
@@ -247,52 +279,120 @@ func cmdCall(o *opts, rest []string, stdio IO) error {
 	if err != nil {
 		return &ExitError{ExitUsage, err}
 	}
+	entry := audit.Entry{Time: time.Now().UTC(), Server: server, Tool: tool, Agent: audit.DetectAgent()}
+	if wd, err := os.Getwd(); err == nil {
+		entry.Cwd = wd
+	}
+	entry.SetArgs(args, c.Audit != nil && c.Audit.LogArgs)
+	err = doCall(o, c, s, server, tool, args, stdio, &entry)
+	if c.AuditEnabled() {
+		entry.DurationMs = time.Since(entry.Time).Milliseconds()
+		entry.Exit = exitCodeOf(err)
+		var ee *ExitError
+		if errors.As(err, &ee) && ee.Code != ExitToolError && ee.Code != ExitDenied {
+			entry.SetError(err)
+		}
+		if aerr := audit.Append(c.AuditPath(), entry); aerr != nil {
+			fmt.Fprintln(stdio.Err, "sluice: warning: could not write audit log:", aerr)
+		}
+	}
+	return err
+}
+
+func exitCodeOf(err error) int {
+	if err == nil {
+		return ExitOK
+	}
+	var ee *ExitError
+	if errors.As(err, &ee) {
+		return ee.Code
+	}
+	return ExitUsage
+}
+
+func doCall(o *opts, c *config.Config, s *config.Server, server, tool string, args map[string]any, stdio IO, entry *audit.Entry) error {
 	p := policyOf(s)
 	d := p.Check(tool, nil)
+	deny := func(reason string) error {
+		entry.Decision, entry.Reason = "denied", reason
+		return deniedErr(s, server, tool, reason)
+	}
 	if !d.Allowed && !p.NeedsMetadata(tool) {
-		return deniedErr(c, server, tool, d.Reason)
+		return deny(d.Reason)
 	}
 
 	ctx, cancel := context.WithTimeout(context.Background(), timeoutFor(o, s))
 	defer cancel()
-	sess, err := connect(ctx, o, server, s)
+	sess, err := connect(ctx, o, c, server, s)
 	if err != nil {
 		return err
 	}
 	defer sess.Close()
-	if !d.Allowed { // only allow_readonly can still allow it: look at annotations
-		t, err := sess.FindTool(ctx, tool)
-		if err != nil {
-			return asConnectErr(err)
-		}
-		if t == nil {
-			return fail(ExitUsage, "server %q has no tool %q (run `mcpx tools %s`)", server, tool, server)
-		}
-		if d = p.Check(tool, readOnlyOf(t)); !d.Allowed {
-			return deniedErr(c, server, tool, d.Reason)
-		}
+	// Always load the tool list first, in this session: the SDK needs the
+	// tool's schema to send SEP-2243 parameter headers (GitHub's hosted server
+	// rejects calls without them), allow_readonly needs its annotations, and an
+	// unknown tool gets a clear error instead of a server-specific one.
+	t, err := sess.FindTool(ctx, tool)
+	if err != nil {
+		return asConnectErr(loginHint(err, server, s))
 	}
+	if t == nil {
+		return fail(ExitUsage, "server %q has no tool %q (run `sluice tools %s`)", server, tool, server)
+	}
+	if d = p.Check(tool, readOnlyOf(t)); !d.Allowed {
+		return deny(d.Reason)
+	}
+	entry.Decision, entry.Reason = "allowed", d.Reason
 	res, err := sess.CallTool(ctx, tool, args)
 	if err != nil {
-		return asConnectErr(err)
+		return asConnectErr(loginHint(err, server, s))
 	}
+
+	var buf bytes.Buffer
 	if o.raw {
-		if err := writeJSON(stdio.Out, res, true); err != nil {
-			return err
-		}
+		err = writeJSON(&buf, res, true)
 	} else {
-		w := stdio.Out
-		if res.IsError {
-			w = stdio.Err
-		}
-		if err := writeResult(w, res); err != nil {
-			return err
-		}
+		err = writeResult(&buf, res)
 	}
+	if err != nil {
+		return err
+	}
+	entry.OutBytes = buf.Len()
 	if res.IsError {
+		stdio.Err.Write(buf.Bytes())
 		return &ExitError{Code: ExitToolError, Err: errors.New("")}
 	}
-	return nil
+	if o.outFile != "" {
+		if err := os.WriteFile(o.outFile, buf.Bytes(), 0o644); err != nil {
+			return fail(ExitUsage, "write --out file: %v", err)
+		}
+		return writeJSON(stdio.Out, map[string]any{"saved_to": o.outFile, "bytes": buf.Len()}, false)
+	}
+	limit := c.MaxOutputBytes()
+	if o.maxOutput != nil {
+		limit = *o.maxOutput
+	}
+	if limit > 0 && buf.Len() > limit {
+		entry.Truncated = true
+		stdio.Out.Write(cutUTF8(buf.Bytes(), limit))
+		fmt.Fprintf(stdio.Out, "\n")
+		fmt.Fprintf(stdio.Err, "sluice: output truncated to %d of %d bytes. Narrow the query (filters, pagination), "+
+			"or save the full result with --out FILE and process it with a script.\n", limit, buf.Len())
+		return nil
+	}
+	_, err = stdio.Out.Write(buf.Bytes())
+	return err
+}
+
+// cutUTF8 returns at most n bytes of b without splitting a UTF-8 sequence.
+func cutUTF8(b []byte, n int) []byte {
+	if len(b) <= n {
+		return b
+	}
+	for n > 0 && !utf8.RuneStart(b[n]) {
+		n--
+	}
+	return b[:n]
 }
 
 // buildArgs merges the positional JSON (or stdin / @file) with -a/-s flags.
@@ -374,7 +474,7 @@ func writeResult(w io.Writer, res *mcp.CallToolResult) error {
 
 func cmdPolicy(o *opts, rest []string, stdio IO) error {
 	if len(rest) != 1 {
-		return fail(ExitUsage, "usage: mcpx policy <server>")
+		return fail(ExitUsage, "usage: sluice policy <server>")
 	}
 	c, err := loadConfig(o)
 	if err != nil {
@@ -386,7 +486,7 @@ func cmdPolicy(o *opts, rest []string, stdio IO) error {
 	}
 	ctx, cancel := context.WithTimeout(context.Background(), timeoutFor(o, s))
 	defer cancel()
-	sess, err := connect(ctx, o, rest[0], s)
+	sess, err := connect(ctx, o, c, rest[0], s)
 	if err != nil {
 		return err
 	}
@@ -413,7 +513,7 @@ func cmdPolicy(o *opts, rest []string, stdio IO) error {
 		fmt.Fprintf(tw, "%s\t%s\t%s\t%s\n", mark, t.Name, ro, d.Reason)
 	}
 	tw.Flush()
-	fmt.Fprintf(stdio.Out, "\n%d of %d tools allowed. Edit %s to change.\n", n, len(all), c.Path)
+	fmt.Fprintf(stdio.Out, "\n%d of %d tools allowed. Edit %s to change.\n", n, len(all), s.Source)
 	return nil
 }
 
@@ -421,14 +521,23 @@ func cmdPolicy(o *opts, rest []string, stdio IO) error {
 
 func cmdDoctor(o *opts, rest []string, stdio IO) error {
 	if len(rest) > 1 {
-		return fail(ExitUsage, "usage: mcpx doctor [server]")
+		return fail(ExitUsage, "usage: sluice doctor [server]")
 	}
 	c, err := loadConfig(o)
 	if err != nil {
 		return err
 	}
 	fmt.Fprintf(stdio.Out, "config: %s\n", c.Path)
+	if c.AuditEnabled() {
+		fmt.Fprintf(stdio.Out, "audit:  %s\n", c.AuditPath())
+	} else {
+		fmt.Fprintln(stdio.Out, "audit:  disabled")
+	}
 	names := c.Names()
+	if len(names) == 0 {
+		fmt.Fprintln(stdio.Out, "\nno servers configured: run `sluice presets`, then `sluice add <preset>`")
+		return &ExitError{Code: ExitUsage, Err: errors.New("no servers configured")}
+	}
 	if len(rest) == 1 {
 		if _, err := serverFor(c, rest[0]); err != nil {
 			return err
@@ -453,9 +562,19 @@ func cmdDoctor(o *opts, rest []string, stdio IO) error {
 			bad++
 			continue
 		}
+		if s.IsOAuth() {
+			st := oauth.NewStore(c).Status(n, mustResolvedURL(s))
+			fmt.Fprintf(stdio.Out, "  oauth %s\n", st)
+			if st != "logged in" && st != "logged in (refreshable)" {
+				fmt.Fprintf(stdio.Out, "  FAIL  run `sluice login %s` (opens a browser; a human must do this)\n", n)
+				bad++
+				continue
+			}
+		}
 		ctx, cancel := context.WithTimeout(context.Background(), timeoutFor(o, s))
 		start := time.Now()
-		sess, err := client.Connect(ctx, n, s, o.verbose)
+		sess, err := client.Connect(ctx, n, s, clientOptions(o, c, n))
+		err = loginHint(err, n, s)
 		if err == nil {
 			var tools []*mcp.Tool
 			tools, err = sess.ListTools(ctx)
@@ -485,7 +604,7 @@ func cmdDoctor(o *opts, rest []string, stdio IO) error {
 
 // ---- init / docs / version -------------------------------------------------
 
-func cmdInit(o *opts, stdio IO) error {
+func cmdInit(o *opts, presetNames []string, stdio IO) error {
 	p := o.configPath
 	if p == "" {
 		var err error
@@ -509,10 +628,26 @@ func cmdInit(o *opts, stdio IO) error {
 		if err := os.WriteFile(envPath, []byte(agentdocs.EnvTemplate), 0o600); err != nil {
 			return err
 		}
-		fmt.Fprintf(stdio.Out, "created %s (put your tokens here)\n", envPath)
+		fmt.Fprintf(stdio.Out, "created %s (secrets go here)\n", envPath)
 	}
-	fmt.Fprintln(stdio.Out, "next: fill in the tokens, then run `mcpx doctor` and `mcpx policy <server>`")
+	if len(presetNames) == 0 {
+		fmt.Fprintln(stdio.Out, "next: `sluice presets` to see ready-made servers, then `sluice add <preset>`")
+		return nil
+	}
+	o.configPath = p
+	for _, name := range presetNames {
+		if err := cmdAdd(o, []string{name}, stdio); err != nil {
+			return err
+		}
+	}
 	return nil
+}
+
+func mustResolvedURL(s *config.Server) string {
+	if r, err := s.Resolved(); err == nil {
+		return r.URL
+	}
+	return s.URL
 }
 
 func cmdGuide(stdio IO) error {
@@ -526,7 +661,11 @@ func cmdSnippet(stdio IO) error {
 }
 
 func cmdVersion(stdio IO) error {
-	fmt.Fprintf(stdio.Out, "mcpx %s\n", client.Version)
+	fmt.Fprintf(stdio.Out, "sluice %s", client.Version)
+	if client.Commit != "" {
+		fmt.Fprintf(stdio.Out, " (%s, %s)", client.Commit, client.Date)
+	}
+	fmt.Fprintf(stdio.Out, " %s/%s\n", runtime.GOOS, runtime.GOARCH)
 	return nil
 }
 
