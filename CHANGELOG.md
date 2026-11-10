@@ -47,3 +47,6 @@ First public release (the project was called `mcpx` during development).
 - `install.ps1` runs in a child scope, so `irm | iex` leaves the caller's
   PowerShell preferences untouched.
 - Agent detection no longer reads a user's `CODEX_HOME` as "codex".
+- Vercel preset, checked against the live tool list (246 tools): denies
+  `get_or_create_*` and `get_access_to_vercel_url` (writes with read-like
+  names) and the tools that return env var values or tokens.

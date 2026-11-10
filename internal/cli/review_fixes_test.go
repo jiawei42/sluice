@@ -14,8 +14,11 @@ import (
 	"testing"
 
 	"github.com/modelcontextprotocol/go-sdk/mcp"
+	"golang.org/x/oauth2"
 
 	"github.com/jiawei42/sluice/internal/fakeserver"
+	"github.com/jiawei42/sluice/internal/oauth"
+	"github.com/jiawei42/sluice/internal/presets"
 )
 
 // loggedIn returns a config whose "svc" server is logged in to f.
@@ -162,6 +165,24 @@ func TestAddForceReplacesJSONFile(t *testing.T) {
 	}
 	if r := runCLI(t, cfg, "", "servers"); r.code != 0 || !strings.Contains(r.out, "github") {
 		t.Fatalf("config must still load: %d %q %q", r.code, r.out, r.err)
+	}
+}
+
+func TestAddSkipsLoginHintWhenLoggedIn(t *testing.T) {
+	dir := t.TempDir()
+	cfg := filepath.Join(dir, "config.json")
+	os.WriteFile(cfg, []byte(`{"servers":{}}`), 0o600)
+	if r := runCLI(t, cfg, "", "add", "vercel"); r.code != 0 || !strings.Contains(r.out, "sluice login vercel") {
+		t.Fatalf("first add should point at login: %d %q %q", r.code, r.out, r.err)
+	}
+	p, _ := presets.Get("vercel")
+	store := oauth.Store{Dir: filepath.Join(dir, "tokens")}
+	if err := store.Save("vercel", &oauth.Record{URL: p.Server.URL, Token: &oauth2.Token{AccessToken: "test", RefreshToken: "test"}}); err != nil {
+		t.Fatal(err)
+	}
+	r := runCLI(t, cfg, "", "add", "vercel", "--force")
+	if r.code != 0 || strings.Contains(r.out, "sluice login") {
+		t.Fatalf("re-add while logged in must not ask for a login: %d %q %q", r.code, r.out, r.err)
 	}
 }
 
