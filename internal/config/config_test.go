@@ -22,19 +22,20 @@ func TestStripJSONComments(t *testing.T) {
 }
 
 func TestExpand(t *testing.T) {
-	t.Setenv("MCPX_A", "one")
-	got, err := Expand("Bearer ${env:MCPX_A} $HOME ${notenv}")
+	t.Setenv("SLUICE_A", "one")
+	got, err := Expand("Bearer ${env:SLUICE_A} $HOME ${notenv}")
 	if err != nil || got != "Bearer one $HOME ${notenv}" {
 		t.Fatalf("got %q %v", got, err)
 	}
-	if _, err := Expand("${env:MCPX_DEFINITELY_UNSET}"); err == nil {
+	if _, err := Expand("${env:SLUICE_DEFINITELY_UNSET}"); err == nil {
 		t.Fatal("want error for unset var")
 	}
 }
 
 func TestValidate(t *testing.T) {
 	bad := []Config{
-		{},
+		{Servers: map[string]*Server{"x": {Command: "a", Auth: &Auth{Type: "oauth"}}}},
+		{Servers: map[string]*Server{"x": {URL: "http://a", Auth: &Auth{Type: "basic"}}}},
 		{Servers: map[string]*Server{"x": {}}},
 		{Servers: map[string]*Server{"bad name": {Command: "a"}}},
 		{Servers: map[string]*Server{"x": {Command: "a", Allow: []string{"["}}}},
@@ -44,6 +45,9 @@ func TestValidate(t *testing.T) {
 		if err := c.Validate(); err == nil {
 			t.Errorf("case %d: want error", i)
 		}
+	}
+	if err := (&Config{}).Validate(); err != nil {
+		t.Fatalf("empty config should be valid: %v", err)
 	}
 	ok := Config{Servers: map[string]*Server{"x": {URL: "http://a"}, "y": {Command: "a"}}}
 	if err := ok.Validate(); err != nil || ok.Servers["x"].Transport != "http" || ok.Servers["y"].Transport != "stdio" {

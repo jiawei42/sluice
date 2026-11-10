@@ -10,7 +10,7 @@ import (
 
 	"github.com/modelcontextprotocol/go-sdk/mcp"
 
-	"github.com/jiawei42/local-mcp/internal/fakeserver"
+	"github.com/jiawei42/sluice/internal/fakeserver"
 )
 
 func main() {

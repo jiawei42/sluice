@@ -1,10 +1,10 @@
 // Package agents embeds the agent-facing documentation and config templates
-// so the mcpx binary can print them (`mcpx guide`, `mcpx agents-snippet`, `mcpx init`).
+// so the sluice binary can print them (`sluice guide`, `sluice agents-snippet`, `sluice init`).
 package agents
 
 import _ "embed"
 
-// Usage is the full guide for AI agents (`mcpx guide`).
+// Usage is the full guide for AI agents (`sluice guide`).
 //
 //go:embed USAGE.md
 var Usage string
@@ -14,12 +14,12 @@ var Usage string
 //go:embed SNIPPET.md
 var Snippet string
 
-// ConfigTemplate is written by `mcpx init`.
+// ConfigTemplate is written by `sluice init`.
 //
 //go:embed config.template.jsonc
 var ConfigTemplate string
 
-// EnvTemplate is written next to the config by `mcpx init`.
+// EnvTemplate is written next to the config by `sluice init`.
 //
 //go:embed env.template
 var EnvTemplate string

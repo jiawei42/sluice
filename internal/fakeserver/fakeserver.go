@@ -1,9 +1,10 @@
-// Package fakeserver is a tiny MCP server used by tests and for trying mcpx
+// Package fakeserver is a tiny MCP server used by tests and for trying sluice
 // without any credentials (`go run ./internal/fakeserver/cmd`).
 package fakeserver
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 
 	"github.com/modelcontextprotocol/go-sdk/mcp"
@@ -70,6 +71,28 @@ func New() *mcp.Server {
 		func(_ context.Context, _ *mcp.CallToolRequest, in idIn) (*mcp.CallToolResult, any, error) {
 			return text("deleted " + in.ID), nil, nil
 		})
+
+	// lookup mirrors its "owner" argument into an Mcp-Param-owner HTTP header
+	// (SEP-2243), like GitHub's hosted server. Clients must know the tool's
+	// schema before calling it over HTTP, or the server rejects the request.
+	s.AddTool(&mcp.Tool{
+		Name:        "lookup",
+		Description: "Look up an owner (argument is mirrored into an HTTP header).",
+		Annotations: ro,
+		InputSchema: map[string]any{
+			"type":       "object",
+			"properties": map[string]any{"owner": map[string]any{"type": "string", "x-mcp-header": "owner"}},
+			"required":   []string{"owner"},
+		},
+	}, func(_ context.Context, req *mcp.CallToolRequest) (*mcp.CallToolResult, error) {
+		var in struct {
+			Owner string `json:"owner"`
+		}
+		if err := json.Unmarshal(req.Params.Arguments, &in); err != nil {
+			return nil, err
+		}
+		return text("owner=" + in.Owner), nil
+	})
 
 	mcp.AddTool(s, &mcp.Tool{Name: "fail", Description: "Always fails."},
 		func(_ context.Context, _ *mcp.CallToolRequest, _ struct{}) (*mcp.CallToolResult, any, error) {

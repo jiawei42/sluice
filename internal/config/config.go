@@ -1,4 +1,4 @@
-// Package config loads the mcpx configuration file, expands ${env:VAR}
+// Package config loads the sluice configuration file, expands ${env:VAR}
 // references and loads the optional .env file that sits next to it.
 package config
 
@@ -45,29 +45,96 @@ type Server struct {
 
 	// Timeout such as "60s" or "2m". Empty means DefaultTimeout.
 	Timeout string `json:"timeout,omitempty"`
+
+	// Auth configures OAuth for http servers that need it (Vercel, Linear, Notion, ...).
+	Auth *Auth `json:"auth,omitempty"`
+
+	// Preset records which built-in preset created this server (informational).
+	Preset string `json:"preset,omitempty"`
+
+	// Source is the file this server was loaded from (not part of the file).
+	Source string `json:"-"`
 }
 
-// Config is the whole configuration file.
+// Auth is per-server OAuth configuration. With no client_id, sluice uses
+// OAuth dynamic client registration, which most hosted MCP servers support.
+type Auth struct {
+	Type         string   `json:"type"` // "oauth"
+	ClientID     string   `json:"client_id,omitempty"`
+	ClientSecret string   `json:"client_secret,omitempty"` // use ${env:VAR}
+	Scopes       []string `json:"scopes,omitempty"`
+	// RedirectPort fixes the loopback callback port (needed for pre-registered
+	// clients whose redirect URI must match exactly). 0 = pick a free port.
+	RedirectPort int `json:"redirect_port,omitempty"`
+}
+
+// IsOAuth reports whether the server uses OAuth.
+func (s *Server) IsOAuth() bool { return s.Auth != nil && s.Auth.Type == "oauth" }
+
+// Audit configures the call log.
+type Audit struct {
+	// Enabled defaults to true.
+	Enabled *bool `json:"enabled,omitempty"`
+	// Path defaults to <config dir>/audit.jsonl.
+	Path string `json:"path,omitempty"`
+	// LogArgs records argument values. Default false: only argument names and a hash.
+	LogArgs bool `json:"log_args,omitempty"`
+}
+
+// DefaultMaxOutput is the default cap on bytes printed by `call` (about 25k tokens).
+const DefaultMaxOutput = 100_000
+
+// Config is the whole configuration.
 type Config struct {
 	Servers map[string]*Server `json:"servers"`
+	Audit   *Audit             `json:"audit,omitempty"`
+	// MaxOutput caps bytes printed by `call`. Omitted = DefaultMaxOutput, 0 = unlimited.
+	MaxOutput *int `json:"max_output,omitempty"`
 
 	// Path is where the config was loaded from (not part of the file).
 	Path string `json:"-"`
 }
 
+// Dir is the directory holding the config, .env, servers.d, tokens and the audit log.
+func (c *Config) Dir() string { return filepath.Dir(c.Path) }
+
+// ServersDir is where `sluice add` writes one file per server.
+func (c *Config) ServersDir() string { return filepath.Join(c.Dir(), "servers.d") }
+
+// AuditEnabled reports whether calls are logged.
+func (c *Config) AuditEnabled() bool {
+	return c.Audit == nil || c.Audit.Enabled == nil || *c.Audit.Enabled
+}
+
+// AuditPath is the audit log file.
+func (c *Config) AuditPath() string {
+	if c.Audit != nil && c.Audit.Path != "" {
+		return c.Audit.Path
+	}
+	return filepath.Join(c.Dir(), "audit.jsonl")
+}
+
+// MaxOutputBytes returns the output cap (0 = unlimited).
+func (c *Config) MaxOutputBytes() int {
+	if c.MaxOutput == nil {
+		return DefaultMaxOutput
+	}
+	return *c.MaxOutput
+}
+
 var serverNameRe = regexp.MustCompile(`^[A-Za-z0-9][A-Za-z0-9_-]*$`)
 
-// DefaultPath returns the config path: $MCPX_CONFIG, else <UserConfigDir>/mcpx/config.json
-// (%AppData%\mcpx\config.json on Windows, ~/.config/mcpx/config.json on Linux).
+// DefaultPath returns the config path: $SLUICE_CONFIG, else <UserConfigDir>/sluice/config.json
+// (%AppData%\sluice\config.json on Windows, ~/.config/sluice/config.json on Linux).
 func DefaultPath() (string, error) {
-	if p := os.Getenv("MCPX_CONFIG"); p != "" {
+	if p := os.Getenv("SLUICE_CONFIG"); p != "" {
 		return p, nil
 	}
 	dir, err := os.UserConfigDir()
 	if err != nil {
 		return "", fmt.Errorf("cannot determine user config dir: %w", err)
 	}
-	return filepath.Join(dir, "mcpx", "config.json"), nil
+	return filepath.Join(dir, "sluice", "config.json"), nil
 }
 
 // Load reads and validates the config at p. It also loads <dir of p>/.env
@@ -76,7 +143,7 @@ func Load(p string) (*Config, error) {
 	data, err := os.ReadFile(p)
 	if err != nil {
 		if errors.Is(err, os.ErrNotExist) {
-			return nil, fmt.Errorf("config not found at %s (run `mcpx init` to create one)", p)
+			return nil, fmt.Errorf("config not found at %s (run `sluice init` to create one)", p)
 		}
 		return nil, err
 	}
@@ -84,22 +151,72 @@ func Load(p string) (*Config, error) {
 		return nil, err
 	}
 	var c Config
-	dec := json.NewDecoder(strings.NewReader(StripJSONComments(string(data))))
-	dec.DisallowUnknownFields()
-	if err := dec.Decode(&c); err != nil {
+	if err := decodeStrict(data, &c); err != nil {
 		return nil, fmt.Errorf("parse %s: %w", p, err)
 	}
 	c.Path = p
+	if c.Servers == nil {
+		c.Servers = map[string]*Server{}
+	}
+	for _, s := range c.Servers {
+		if s != nil {
+			s.Source = p
+		}
+	}
+	if err := c.loadServersDir(); err != nil {
+		return nil, err
+	}
 	if err := c.Validate(); err != nil {
 		return nil, fmt.Errorf("%s: %w", p, err)
 	}
 	return &c, nil
 }
 
+// loadServersDir adds servers from servers.d/<name>.json(c). A name defined
+// in two places is an error rather than a silent override.
+func (c *Config) loadServersDir() error {
+	entries, err := os.ReadDir(c.ServersDir())
+	if err != nil {
+		if errors.Is(err, os.ErrNotExist) {
+			return nil
+		}
+		return err
+	}
+	for _, e := range entries {
+		ext := filepath.Ext(e.Name())
+		if e.IsDir() || (ext != ".json" && ext != ".jsonc") {
+			continue
+		}
+		name := strings.TrimSuffix(e.Name(), ext)
+		fp := filepath.Join(c.ServersDir(), e.Name())
+		data, err := os.ReadFile(fp)
+		if err != nil {
+			return err
+		}
+		var s Server
+		if err := decodeStrict(data, &s); err != nil {
+			return fmt.Errorf("parse %s: %w", fp, err)
+		}
+		if prev, dup := c.Servers[name]; dup {
+			return fmt.Errorf("server %q is defined twice: %s and %s", name, prev.Source, fp)
+		}
+		s.Source = fp
+		c.Servers[name] = &s
+	}
+	return nil
+}
+
+func decodeStrict(data []byte, v any) error {
+	dec := json.NewDecoder(strings.NewReader(StripJSONComments(string(data))))
+	dec.DisallowUnknownFields()
+	return dec.Decode(v)
+}
+
 // Validate checks structure and patterns and fills in the inferred transport.
+// A config with no servers is valid (commands that need one say so).
 func (c *Config) Validate() error {
-	if len(c.Servers) == 0 {
-		return errors.New(`no servers defined under "servers"`)
+	if c.MaxOutput != nil && *c.MaxOutput < 0 {
+		return errors.New("max_output must be >= 0")
 	}
 	for name, s := range c.Servers {
 		if !serverNameRe.MatchString(name) {
@@ -138,9 +255,23 @@ func (c *Config) Validate() error {
 				return fmt.Errorf("server %q: bad timeout %q: %w", name, s.Timeout, err)
 			}
 		}
+		if s.Auth != nil {
+			if s.Auth.Type != "oauth" {
+				return fmt.Errorf("server %q: auth.type must be \"oauth\" (got %q)", name, s.Auth.Type)
+			}
+			if s.Transport != "http" {
+				return fmt.Errorf("server %q: oauth needs the http transport", name)
+			}
+			if s.Auth.RedirectPort < 0 || s.Auth.RedirectPort > 65535 {
+				return fmt.Errorf("server %q: bad auth.redirect_port", name)
+			}
+		}
 	}
 	return nil
 }
+
+// ValidName reports whether name can be used as a server name.
+func ValidName(name string) bool { return serverNameRe.MatchString(name) }
 
 // Names returns server names sorted.
 func (c *Config) Names() []string {
@@ -205,6 +336,10 @@ func (s *Server) EnvRefs() []string {
 	for _, v := range s.Headers {
 		add(v)
 	}
+	if s.Auth != nil {
+		add(s.Auth.ClientID)
+		add(s.Auth.ClientSecret)
+	}
 	sort.Strings(out)
 	return out
 }
@@ -235,6 +370,12 @@ func (s *Server) Resolved() (*Server, error) {
 	r.Headers = make(map[string]string, len(s.Headers))
 	for k, v := range s.Headers {
 		r.Headers[k] = ex(v)
+	}
+	if s.Auth != nil {
+		a := *s.Auth
+		a.ClientID = ex(a.ClientID)
+		a.ClientSecret = ex(a.ClientSecret)
+		r.Auth = &a
 	}
 	if err != nil {
 		return nil, err
@@ -270,6 +411,9 @@ func LoadDotEnv(p string) error {
 		v = strings.TrimSpace(v)
 		if len(v) >= 2 && (v[0] == '"' && v[len(v)-1] == '"' || v[0] == '\'' && v[len(v)-1] == '\'') {
 			v = v[1 : len(v)-1]
+		}
+		if v == "" {
+			continue // placeholder written by `sluice add`, not a value
 		}
 		if _, exists := os.LookupEnv(k); !exists {
 			os.Setenv(k, v)

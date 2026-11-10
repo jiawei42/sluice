@@ -1,10 +1,11 @@
-// Package cli implements the mcpx command line.
+// Package cli implements the sluice command line.
 package cli
 
 import (
 	"errors"
 	"fmt"
 	"io"
+	"strconv"
 	"strings"
 	"time"
 )
@@ -45,39 +46,62 @@ type opts struct {
 	args       []kv // -a key=value (value parsed as JSON when possible)
 	strs       []kv // -s key=value (value always a string)
 	help       bool
+
+	outFile   string // call --out FILE
+	maxOutput *int   // call --max-output N (0 = unlimited)
+
+	name      string // add --name
+	force     bool   // add --force
+	noBrowser bool   // login --no-browser
+
+	since        time.Duration // audit --since
+	serverFilter string        // audit --server
+	deniedOnly   bool          // audit --denied
+	limit        int           // audit --limit (-1 = all)
 }
 
 type kv struct{ key, val string }
 
-const usageText = `mcpx — call MCP servers from the shell, with a per-server whitelist.
+const usageText = `sluice — governed access to MCP servers for AI agents and scripts.
+Every server has a whitelist; anything not allowed is refused before it is sent.
 
-Usage:
-  mcpx servers                         list configured servers
-  mcpx tools  <server>                 list tools you are allowed to use
-  mcpx schema <server> <tool>          show a tool's input schema
-  mcpx call   <server> <tool> [JSON]   call a tool (JSON | - for stdin | @file.json)
-  mcpx guide                           full usage guide for AI agents
-  mcpx agents-snippet                  short text to paste into AGENTS.md / CLAUDE.md / GEMINI.md
+For agents:
+  sluice servers                         list configured servers
+  sluice tools  <server>                 list the tools you may use
+  sluice schema <server> <tool>          show a tool's input schema
+  sluice call   <server> <tool> [JSON]   call a tool (JSON | - for stdin | @file.json)
+  sluice guide                           full usage guide for AI agents
+  sluice agents-snippet                  short text for AGENTS.md / CLAUDE.md / GEMINI.md
 
 Setup (for humans):
-  mcpx init                            create a starter config
-  mcpx doctor [server]                 check config, env vars and connectivity
-  mcpx policy <server>                 show every tool and whether the whitelist allows it
-  mcpx version
+  sluice init [preset...]                create the config (optionally adding presets)
+  sluice presets                         list ready-made servers (GitHub, Vercel, Linear, ...)
+  sluice add <preset> [--name N]         add a server with a safe default whitelist
+  sluice remove <server>                 remove a server added with ` + "`add`" + `
+  sluice login <server>                  sign in to an OAuth server in your browser
+  sluice logout <server>                 delete the stored OAuth token
+  sluice doctor [server]                 check env vars, logins and connectivity
+  sluice policy <server>                 show every tool and the whitelist decision
+  sluice audit                           show recent calls (allowed and denied)
+  sluice version
 
 Flags:
   -a, --arg key=value    add an argument (value parsed as JSON if valid, else string)
   -s, --str key=value    add a string argument (never parsed)
-      --json             machine-readable output (servers, tools)
-      --raw              print the full MCP CallToolResult as JSON (call)
+      --out FILE         call: save the full result to FILE, print only a summary
+      --max-output N     call: cap printed bytes (default from config, 100000; 0 = no cap)
+      --json             machine-readable output (servers, tools, presets, audit)
+      --raw              call: print the full MCP CallToolResult as JSON
       --timeout 90s      override the server timeout
-      --config PATH      config file (default: $MCPX_CONFIG or the user config dir)
+      --config PATH      config file (default: $SLUICE_CONFIG or the user config dir)
+      --since 24h        audit: only newer entries      --server NAME   audit: one server
+      --denied           audit: only denied calls       --limit N       audit: last N (default 50, -1 all)
   -v, --verbose          show server stderr
 
-Exit codes: 0 ok, 1 tool error, 2 usage/config, 3 denied by whitelist, 4 connection error.
+Exit codes: 0 ok, 1 tool error, 2 usage/config, 3 denied by whitelist, 4 connection or login needed.
 `
 
-// Run executes mcpx with args (without the program name) and returns the exit code.
+// Run executes sluice with args (without the program name) and returns the exit code.
 func Run(args []string, stdio IO) int {
 	err := run(args, stdio)
 	if err == nil {
@@ -86,11 +110,11 @@ func Run(args []string, stdio IO) int {
 	var ee *ExitError
 	if errors.As(err, &ee) {
 		if ee.Err != nil && ee.Err.Error() != "" {
-			fmt.Fprintln(stdio.Err, "mcpx:", ee.Err)
+			fmt.Fprintln(stdio.Err, "sluice:", ee.Err)
 		}
 		return ee.Code
 	}
-	fmt.Fprintln(stdio.Err, "mcpx:", err)
+	fmt.Fprintln(stdio.Err, "sluice:", err)
 	return ExitUsage
 }
 
@@ -118,7 +142,19 @@ func run(args []string, stdio IO) error {
 	case "agents-snippet":
 		return cmdSnippet(stdio)
 	case "init":
-		return cmdInit(o, stdio)
+		return cmdInit(o, rest, stdio)
+	case "presets":
+		return cmdPresets(o, rest, stdio)
+	case "add":
+		return cmdAdd(o, rest, stdio)
+	case "remove", "rm":
+		return cmdRemove(o, rest, stdio)
+	case "login":
+		return cmdLogin(o, rest, stdio)
+	case "logout":
+		return cmdLogout(o, rest, stdio)
+	case "audit":
+		return cmdAudit(o, rest, stdio)
 	case "servers":
 		return cmdServers(o, rest, stdio)
 	case "tools":
@@ -132,7 +168,7 @@ func run(args []string, stdio IO) error {
 	case "doctor":
 		return cmdDoctor(o, rest, stdio)
 	default:
-		return fail(ExitUsage, "unknown command %q (run `mcpx help`)", cmd)
+		return fail(ExitUsage, "unknown command %q (run `sluice help`)", cmd)
 	}
 }
 
@@ -206,9 +242,56 @@ func parseFlags(args []string) (*opts, []string, error) {
 			} else {
 				o.strs = append(o.strs, kv{k, vv})
 			}
+		case "--force":
+			o.force = true
+		case "--no-browser":
+			o.noBrowser = true
+		case "--denied":
+			o.deniedOnly = true
+		case "--out", "--name", "--server", "--since", "--max-output", "--limit":
+			v, err := needVal()
+			if err != nil {
+				return nil, nil, err
+			}
+			switch name {
+			case "--out":
+				o.outFile = v
+			case "--name":
+				o.name = v
+			case "--server":
+				o.serverFilter = v
+			case "--since":
+				d, err := parseSince(v)
+				if err != nil {
+					return nil, nil, fmt.Errorf("bad --since %q (use e.g. 30m, 24h, 7d)", v)
+				}
+				o.since = d
+			case "--max-output", "--limit":
+				n, err := strconv.Atoi(v)
+				if err != nil || n < -1 || (name == "--max-output" && n < 0) {
+					return nil, nil, fmt.Errorf("bad %s %q", name, v)
+				}
+				if name == "--limit" {
+					o.limit = n
+				} else {
+					o.maxOutput = &n
+				}
+			}
 		default:
 			return nil, nil, fmt.Errorf("unknown flag %s", name)
 		}
 	}
 	return o, pos, nil
+}
+
+// parseSince accepts Go durations plus a "d" (days) suffix.
+func parseSince(v string) (time.Duration, error) {
+	if strings.HasSuffix(v, "d") {
+		n, err := strconv.Atoi(strings.TrimSuffix(v, "d"))
+		if err != nil || n < 0 {
+			return 0, errors.New("bad days")
+		}
+		return time.Duration(n) * 24 * time.Hour, nil
+	}
+	return time.ParseDuration(v)
 }

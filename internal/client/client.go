@@ -8,17 +8,36 @@ import (
 	"net/http"
 	"os"
 	"os/exec"
+	"runtime/debug"
 	"strings"
 	"sync"
 	"time"
 
+	"github.com/modelcontextprotocol/go-sdk/auth"
 	"github.com/modelcontextprotocol/go-sdk/mcp"
 
-	"github.com/jiawei42/local-mcp/internal/config"
+	"github.com/jiawei42/sluice/internal/config"
 )
 
-// Version is reported to servers as the client version.
+// Version is reported to servers as the client version. Release builds set
+// it with -ldflags "-X github.com/jiawei42/sluice/internal/client.Version=v1.2.3";
+// `go install ...@vX` builds fall back to the module version.
 var Version = "dev"
+
+// Commit and Date are set by release builds.
+var (
+	Commit = ""
+	Date   = ""
+)
+
+func init() {
+	if Version != "dev" {
+		return
+	}
+	if bi, ok := debug.ReadBuildInfo(); ok && bi.Main.Version != "" && bi.Main.Version != "(devel)" {
+		Version = bi.Main.Version
+	}
+}
 
 // Session is an open connection to one server.
 type Session struct {
@@ -27,13 +46,22 @@ type Session struct {
 	stderr *tailBuffer
 }
 
+// Options tune Connect.
+type Options struct {
+	// Verbose copies the server's stderr to ours. Otherwise it is kept only to explain failures.
+	Verbose bool
+	// OAuth, when set, builds the OAuth handler for an http server from its
+	// resolved (env-expanded) definition.
+	OAuth func(resolved *config.Server) (auth.OAuthHandler, error)
+}
+
 // Connect starts (stdio) or contacts (http) the server and initializes MCP.
-// When verbose is false the server's stderr is kept only to explain failures.
-func Connect(ctx context.Context, name string, srv *config.Server, verbose bool) (*Session, error) {
+func Connect(ctx context.Context, name string, srv *config.Server, o Options) (*Session, error) {
 	s, err := srv.Resolved()
 	if err != nil {
 		return nil, fmt.Errorf("server %q: %w", name, err)
 	}
+	verbose := o.Verbose
 	sess := &Session{Name: name, stderr: &tailBuffer{max: 4096}}
 
 	var transport mcp.Transport
@@ -52,17 +80,25 @@ func Connect(ctx context.Context, name string, srv *config.Server, verbose bool)
 		}
 		transport = &mcp.CommandTransport{Command: cmd, TerminateDuration: 2 * time.Second}
 	case "http":
-		transport = &mcp.StreamableClientTransport{
+		t := &mcp.StreamableClientTransport{
 			Endpoint:             s.URL,
 			HTTPClient:           &http.Client{Transport: &headerTransport{headers: s.Headers, base: http.DefaultTransport}},
 			MaxRetries:           1,
 			DisableStandaloneSSE: true, // one-shot CLI: only request/response is needed
 		}
+		if s.IsOAuth() && o.OAuth != nil {
+			h, err := o.OAuth(s)
+			if err != nil {
+				return nil, fmt.Errorf("server %q: %w", name, err)
+			}
+			t.OAuthHandler = h
+		}
+		transport = t
 	default:
 		return nil, fmt.Errorf("server %q: unknown transport %q", name, s.Transport)
 	}
 
-	c := mcp.NewClient(&mcp.Implementation{Name: "mcpx", Version: Version}, nil)
+	c := mcp.NewClient(&mcp.Implementation{Name: "sluice", Version: Version}, nil)
 	cs, err := c.Connect(ctx, transport, nil)
 	if err != nil {
 		return nil, sess.wrap(fmt.Errorf("connect to %q: %w", name, err))

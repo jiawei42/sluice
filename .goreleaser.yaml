@@ -1,0 +1,52 @@
+# Release builds: `git tag vX.Y.Z && git push origin vX.Y.Z` runs .github/workflows/release.yml.
+# Local dry run: goreleaser release --snapshot --clean
+version: 2
+project_name: sluice
+
+before:
+  hooks:
+    - go mod tidy
+    - go test ./...
+
+builds:
+  - id: sluice
+    main: ./cmd/sluice
+    binary: sluice
+    env: [CGO_ENABLED=0]
+    goos: [linux, darwin, windows]
+    goarch: [amd64, arm64]
+    flags: [-trimpath]
+    ldflags:
+      - -s -w
+      - -X github.com/jiawei42/sluice/internal/client.Version=v{{ .Version }}
+      - -X github.com/jiawei42/sluice/internal/client.Commit={{ .ShortCommit }}
+      - -X github.com/jiawei42/sluice/internal/client.Date={{ .Date }}
+
+archives:
+  - id: default
+    # Version-less names so install scripts can use /releases/latest/download/<name>.
+    name_template: "sluice_{{ .Os }}_{{ .Arch }}"
+    formats: [tar.gz]
+    format_overrides:
+      - goos: windows
+        formats: [zip]
+    files: [README.md, LICENSE, CHANGELOG.md]
+
+checksum:
+  name_template: checksums.txt
+  algorithm: sha256
+
+changelog:
+  use: github
+  sort: asc
+  filters:
+    exclude: ["^docs:", "^test:", "^chore:"]
+
+release:
+  github:
+    owner: jiawei42
+    name: sluice
+  footer: |
+    Install: `curl -fsSL https://raw.githubusercontent.com/jiawei42/sluice/main/install.sh | sh`
+    (Windows: `irm https://raw.githubusercontent.com/jiawei42/sluice/main/install.ps1 | iex`).
+    Every archive is listed with its SHA-256 in checksums.txt; the install scripts verify it.

@@ -1,81 +1,133 @@
-# mcpx
+# sluice
 
-用一個 Go 執行檔，從 shell 呼叫 MCP server（GitHub、Vercel…），並用每個 server 各自的**白名單**控制 agent 能用哪些 tool。
-Claude Code、Codex、Gemini CLI 或一般 script 都用同一套方式接。
+**Governed MCP access for AI agents and scripts.** One small binary lets Claude Code,
+Codex, Gemini CLI, Cursor or a shell script use MCP servers such as GitHub, Vercel,
+Linear, Notion, Sentry and Supabase. Every call passes a per-server whitelist and
+is written to an audit log.
 
 ```
-agent / script ──shell──▶ mcpx ──(白名單檢查)──▶ MCP server（stdio 或 HTTP）
+agent / script ──shell──▶ sluice ──whitelist──▶ MCP server (stdio or HTTP, token or OAuth)
+                              └──▶ audit.jsonl
 ```
 
-## 安裝
+[繁體中文說明](README.zh-TW.md)
+
+## Why
+
+- **Deny by default.** A tool that is not on the server's `allow` list is
+  hidden from the agent and refused before anything is sent. `deny` always wins.
+- **Works with every agent.** It is a CLI with stable exit codes, so any agent
+  that can run shell commands can use it, and the agent's context is not filled
+  with dozens of tool definitions.
+- **See what happened.** `sluice audit` shows every call, allowed or denied,
+  with the agent, the duration and the exit code. Argument values are excluded
+  unless you opt in.
+- **Safe defaults.** Presets ship read-only whitelists. Output is capped so one
+  huge result cannot flood the agent's context.
+- **Real auth.** Token servers read secrets from a `.env` outside your project.
+  OAuth servers use a browser login with PKCE and refresh automatically. Agents
+  never start a login themselves.
+
+## Install
 
 ```bash
-go install github.com/jiawei42/local-mcp/cmd/mcpx@latest
+# macOS / Linux
+curl -fsSL https://raw.githubusercontent.com/jiawei42/sluice/main/install.sh | sh
+```
+```powershell
+# Windows (PowerShell)
+irm https://raw.githubusercontent.com/jiawei42/sluice/main/install.ps1 | iex
+```
+```bash
+# or, with Go 1.26+
+go install github.com/jiawei42/sluice/cmd/sluice@latest
 ```
 
-在本 repo 內開發時則用 `go install ./cmd/mcpx`。會裝到 `$(go env GOPATH)/bin`（Windows 通常是 `%USERPROFILE%\go\bin`），請確認它在 PATH 裡。
+The scripts download the release archive for your OS and CPU, verify its
+SHA-256 against `checksums.txt`, and install one binary. They need no admin
+rights and send no telemetry. You can also download an archive from
+[Releases](https://github.com/jiawei42/sluice/releases) and check it yourself.
 
-## 設定
+## Quick start
 
 ```bash
-mcpx init
+sluice init github             # create the config and add the GitHub preset
+# put a fine-grained token in GITHUB_TOKEN= in the .env file it printed
+sluice doctor                  # env vars, logins, connectivity
+sluice policy github           # every tool: ALLOW or deny, and why
+sluice call github get_me      # try it
 ```
 
-會建立：
-
-- 設定檔：Windows `%AppData%\mcpx\config.json`、Linux `~/.config/mcpx/config.json`、macOS `~/Library/Application Support/mcpx/config.json`（可用 `MCPX_CONFIG` 或 `--config` 改）
-- 同資料夾的 `.env`：放 token，例如 `GITHUB_TOKEN=...`
-
-設定檔刻意放在專案外，agent 在專案裡工作時不會順手改到白名單。
-
-GitHub token 建議用 [fine-grained PAT](https://github.com/settings/personal-access-tokens)，只開需要的 repo 和權限。
+OAuth services:
 
 ```bash
-mcpx doctor          # 檢查環境變數、連線、各 server 有幾個 tool 被允許
-mcpx policy github   # 列出 GitHub 所有 tool 和白名單的判斷結果，用來調整 allow/deny
+sluice presets                 # github, vercel, linear, notion, sentry, supabase, context7, playwright
+sluice add vercel
+sluice login vercel            # opens your browser once; tokens refresh automatically
 ```
 
-### 白名單規則
+## For agents
+
+```bash
+sluice servers
+sluice tools github
+sluice schema github list_issues
+sluice call github list_issues -a owner=octo -a repo=app -a state=OPEN
+sluice call github get_file_contents '{"owner":"octo","repo":"app","path":"README.md"}'
+sluice call github list_commits -a owner=octo -a repo=app --out commits.json
+```
+
+| Exit | Meaning |
+|---|---|
+| 0 | ok |
+| 1 | the tool returned an error |
+| 2 | usage or config error |
+| 3 | blocked by the whitelist (the agent must ask you, not work around it) |
+| 4 | connection problem or login needed |
+
+`sluice guide` prints the full agent guide ([docs/agents/USAGE.md](docs/agents/USAGE.md)).
+`sluice agents-snippet` prints a short block for `AGENTS.md`, `CLAUDE.md` or `GEMINI.md`.
+
+## Configuration
+
+`sluice init` creates the config directory: `%AppData%\sluice` on Windows,
+`~/.config/sluice` on Linux, `~/Library/Application Support/sluice` on macOS.
+Set `SLUICE_CONFIG` or pass `--config` to use another location.
+
+| Path | Contents |
+|---|---|
+| `config.json` | global settings (`audit`, `max_output`), optional hand-written servers |
+| `servers.d/<name>.jsonc` | one server per file, including its whitelist (`sluice add` writes these) |
+| `.env` | secrets referenced as `${env:NAME}` |
+| `tokens/` | OAuth tokens from `sluice login` |
+| `audit.jsonl` | the call log (`sluice audit`) |
+
+A server entry:
 
 ```jsonc
-"allow": ["get_*", "list_*", "search_*", "create_issue"],  // 符合才可用；空的 = 全部擋
-"deny":  ["delete_*", "merge_*"],                            // 永遠擋，優先於 allow
-"allow_readonly": false                                      // true = 也允許 server 自己標成 readOnlyHint 的 tool
+{
+  "url": "https://api.githubcopilot.com/mcp/",          // or "command"/"args" for stdio
+  "headers": { "Authorization": "Bearer ${env:GITHUB_TOKEN}" },
+  "allow": ["get_*", "list_*", "search_*", "issue_read", "pull_request_read"],
+  "deny":  ["delete_*", "merge_*"],
+  "allow_readonly": false,                               // also admit tools the server marks read-only
+  "timeout": "60s"
+  // OAuth instead of a header: "auth": { "type": "oauth" }
+}
 ```
 
-- 不在白名單的 tool，`mcpx tools` 不會列出，`mcpx call` 會在**連線前**就拒絕（exit code 3），並請 agent 回頭問你。
-- 白名單防的是 agent 誤用，不是惡意繞過：真正的權限邊界是 token 本身的權限，所以 token 要開最小權限。
+## Security model
 
-## 使用
+Read [SECURITY.md](SECURITY.md). In short, the whitelist protects you from an
+agent's mistakes. Your token's permissions decide what is possible at all, so
+keep tokens minimal.
 
-```bash
-mcpx servers
-mcpx tools github
-mcpx schema github list_issues
-mcpx call github list_issues -a owner=octo -a repo=app -a state=OPEN
-mcpx call github get_issue '{"owner":"octo","repo":"app","issue_number":5}'
-```
-
-完整說明（給 agent 看的）：`mcpx guide`，內容同 [docs/agents/USAGE.md](docs/agents/USAGE.md)。
-
-## 讓各家 agent 知道怎麼用
-
-`mcpx agents-snippet` 會印出一小段說明，貼到下列任一處：
-
-| Agent | 全域（所有專案） | 單一專案 |
-|---|---|---|
-| Claude Code | `~/.claude/CLAUDE.md` | `CLAUDE.md` |
-| Codex | `~/.codex/AGENTS.md` | `AGENTS.md` |
-| Gemini CLI | `~/.gemini/GEMINI.md` | `GEMINI.md` |
-
-本 repo 自己的 `CLAUDE.md`、`GEMINI.md` 都只是引用 `AGENTS.md`，只需維護一份。
-
-## 開發
+## Development
 
 ```bash
 go test ./...
-go build -o bin/mcpx.exe ./cmd/mcpx
-go run ./internal/fakeserver/cmd -http :8080   # 本地假 server，不需任何 token 就能試
+go build -o bin/sluice ./cmd/sluice
+go run ./internal/fakeserver/cmd -http :8080      # local MCP server for experiments
 ```
 
-架構與修改規則見 [AGENTS.md](AGENTS.md)。
+Layout and contribution rules: [AGENTS.md](AGENTS.md). License: MIT.
