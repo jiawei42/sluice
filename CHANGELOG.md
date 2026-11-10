@@ -30,3 +30,20 @@ First public release (the project was called `mcpx` during development).
   (every tool and the whitelist decision).
 - Release builds for Linux, macOS and Windows (amd64, arm64) with SHA-256
   checksums, and install scripts that verify them.
+- Headless logins (SSH, containers): paste the final redirect URL into the
+  terminal. WSL opens the Windows browser.
+- Tool-list cache (`cache/`, 24 h): `call` skips the extra `tools/list` round
+  trip when the tool doesn't mirror arguments into HTTP headers, and never
+  lists for stdio servers unless `allow_readonly` needs annotations.
+
+### Fixed during review
+- Token refresh is serialized across processes with a lock file, so parallel
+  calls against providers that rotate refresh tokens no longer force a
+  re-login. Network errors during refresh keep their real cause and are no
+  longer reported as "login required".
+- A plain HTTP 403 is reported as the server's error, not as a missing login.
+- `add --force` over `servers.d/<name>.json` no longer leaves a duplicate.
+- `.env` values ignore inline ` # comments`.
+- `install.ps1` runs in a child scope, so `irm | iex` leaves the caller's
+  PowerShell preferences untouched.
+- Agent detection no longer reads a user's `CODEX_HOME` as "codex".

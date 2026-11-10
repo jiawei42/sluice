@@ -25,6 +25,7 @@ import (
 	"github.com/jiawei42/sluice/internal/config"
 	"github.com/jiawei42/sluice/internal/oauth"
 	"github.com/jiawei42/sluice/internal/policy"
+	"github.com/jiawei42/sluice/internal/toolcache"
 )
 
 func loadConfig(o *opts) (*config.Config, error) {
@@ -66,29 +67,36 @@ func timeoutFor(o *opts, s *config.Server) time.Duration {
 	return s.TimeoutOrDefault()
 }
 
-// clientOptions wires the non-interactive OAuth handler: stored token only,
-// never a browser login.
-func clientOptions(o *opts, c *config.Config, name string) client.Options {
-	store := oauth.NewStore(c)
-	return client.Options{
-		Verbose: o.verbose,
-		OAuth: func(resolved *config.Server) (auth.OAuthHandler, error) {
-			return oauth.AgentHandler(store, name, resolved)
-		},
-	}
+// conn is an open session plus, for OAuth servers, the agent handler that
+// knows whether it had to give up because a login is needed.
+type conn struct {
+	*client.Session
+	auth *oauth.AgentHandler
 }
 
-func connect(ctx context.Context, o *opts, c *config.Config, name string, s *config.Server) (*client.Session, error) {
-	sess, err := client.Connect(ctx, name, s, clientOptions(o, c, name))
+// connect opens a session. OAuth servers use the non-interactive handler:
+// stored token only, never a browser login.
+func connect(ctx context.Context, o *opts, c *config.Config, name string, s *config.Server) (*conn, error) {
+	cn := &conn{}
+	store := oauth.NewStore(c)
+	sess, err := client.Connect(ctx, name, s, client.Options{
+		Verbose: o.verbose,
+		OAuth: func(resolved *config.Server) (auth.OAuthHandler, error) {
+			h, err := oauth.NewAgentHandler(store, name, resolved)
+			cn.auth = h
+			return h, err
+		},
+	})
 	if err != nil {
-		return nil, &ExitError{ExitConnect, loginHint(err, name, s)}
+		return nil, &ExitError{ExitConnect, cn.loginHint(err)}
 	}
-	return sess, nil
+	cn.Session = sess
+	return cn, nil
 }
 
 // loginHint replaces a noisy transport error with the plain instruction when
-// the real cause is a missing or expired OAuth login.
-func loginHint(err error, name string, s *config.Server) error {
+// the handler (or token source) decided a login is needed.
+func (cn *conn) loginHint(err error) error {
 	if err == nil {
 		return nil
 	}
@@ -96,10 +104,45 @@ func loginHint(err error, name string, s *config.Server) error {
 	if errors.As(err, &lr) {
 		return lr
 	}
-	if s.IsOAuth() && (strings.Contains(err.Error(), "401") || strings.Contains(err.Error(), "Unauthorized")) {
-		return &oauth.LoginRequiredError{Server: name}
+	if lr := cn.auth.LoginRequired(); lr != nil {
+		return lr
 	}
 	return err
+}
+
+// listTools lists every tool and refreshes the on-disk tool cache.
+func listTools(ctx context.Context, sess *conn, c *config.Config, name string, s *config.Server) ([]*mcp.Tool, error) {
+	tools, err := sess.ListTools(ctx)
+	if err != nil {
+		return nil, err
+	}
+	toolcache.Save(c, name, s, tools)
+	return tools, nil
+}
+
+// listAndFind lists the tools (in this session) and returns the named one, or nil.
+func listAndFind(ctx context.Context, sess *conn, c *config.Config, name string, s *config.Server, tool string) (*mcp.Tool, error) {
+	tools, err := listTools(ctx, sess, c, name, s)
+	if err != nil {
+		return nil, err
+	}
+	for _, t := range tools {
+		if t.Name == tool {
+			return t, nil
+		}
+	}
+	return nil, nil
+}
+
+// countAllowed counts the tools the whitelist admits.
+func countAllowed(p policy.Policy, tools []*mcp.Tool) int {
+	n := 0
+	for _, t := range tools {
+		if p.Check(t.Name, readOnlyOf(t)).Allowed {
+			n++
+		}
+	}
+	return n
 }
 
 func asConnectErr(err error) error {
@@ -172,7 +215,7 @@ func cmdTools(o *opts, rest []string, stdio IO) error {
 		return err
 	}
 	defer sess.Close()
-	all, err := sess.ListTools(ctx)
+	all, err := listTools(ctx, sess, c, rest[0], s)
 	if err != nil {
 		return asConnectErr(err)
 	}
@@ -233,7 +276,7 @@ func cmdSchema(o *opts, rest []string, stdio IO) error {
 		return err
 	}
 	defer sess.Close()
-	t, err := sess.FindTool(ctx, tool)
+	t, err := listAndFind(ctx, sess, c, server, s, tool)
 	if err != nil {
 		return asConnectErr(err)
 	}
@@ -328,24 +371,48 @@ func doCall(o *opts, c *config.Config, s *config.Server, server, tool string, ar
 		return err
 	}
 	defer sess.Close()
-	// Always load the tool list first, in this session: the SDK needs the
-	// tool's schema to send SEP-2243 parameter headers (GitHub's hosted server
-	// rejects calls without them), allow_readonly needs its annotations, and an
-	// unknown tool gets a clear error instead of a server-specific one.
-	t, err := sess.FindTool(ctx, tool)
-	if err != nil {
-		return asConnectErr(loginHint(err, server, s))
+
+	// The tool list is needed in this session when allow_readonly must see the
+	// tool's annotations, or over HTTP when the tool mirrors arguments into
+	// SEP-2243 headers (the SDK only sends them for tools it has listed, and
+	// GitHub's hosted server rejects calls without them). The on-disk cache
+	// tells us which case applies without a round trip.
+	listed := false
+	loadTool := func() error {
+		t, err := listAndFind(ctx, sess, c, server, s, tool)
+		if err != nil {
+			return asConnectErr(sess.loginHint(err))
+		}
+		if t == nil {
+			return fail(ExitUsage, "server %q has no tool %q (run `sluice tools %s`)", server, tool, server)
+		}
+		listed = true
+		if d = p.Check(tool, readOnlyOf(t)); !d.Allowed {
+			return deny(d.Reason)
+		}
+		return nil
 	}
-	if t == nil {
-		return fail(ExitUsage, "server %q has no tool %q (run `sluice tools %s`)", server, tool, server)
+	needList := !d.Allowed
+	if !needList && s.Transport == "http" {
+		cached, ok := toolcache.Lookup(c, server, s, tool)
+		needList = !ok || toolcache.HasHeaderParams(cached)
 	}
-	if d = p.Check(tool, readOnlyOf(t)); !d.Allowed {
-		return deny(d.Reason)
+	if needList {
+		if err := loadTool(); err != nil {
+			return err
+		}
 	}
 	entry.Decision, entry.Reason = "allowed", d.Reason
 	res, err := sess.CallTool(ctx, tool, args)
+	if err != nil && !listed && strings.Contains(err.Error(), "header mismatch") {
+		// The cache was stale (the tool now uses parameter headers): list and retry once.
+		if lerr := loadTool(); lerr != nil {
+			return lerr
+		}
+		res, err = sess.CallTool(ctx, tool, args)
+	}
 	if err != nil {
-		return asConnectErr(loginHint(err, server, s))
+		return asConnectErr(sess.loginHint(err))
 	}
 
 	var buf bytes.Buffer
@@ -491,7 +558,7 @@ func cmdPolicy(o *opts, rest []string, stdio IO) error {
 		return err
 	}
 	defer sess.Close()
-	all, err := sess.ListTools(ctx)
+	all, err := listTools(ctx, sess, c, rest[0], s)
 	if err != nil {
 		return asConnectErr(err)
 	}
@@ -565,7 +632,7 @@ func cmdDoctor(o *opts, rest []string, stdio IO) error {
 		if s.IsOAuth() {
 			st := oauth.NewStore(c).Status(n, mustResolvedURL(s))
 			fmt.Fprintf(stdio.Out, "  oauth %s\n", st)
-			if st != "logged in" && st != "logged in (refreshable)" {
+			if !st.Usable() {
 				fmt.Fprintf(stdio.Out, "  FAIL  run `sluice login %s` (opens a browser; a human must do this)\n", n)
 				bad++
 				continue
@@ -573,21 +640,14 @@ func cmdDoctor(o *opts, rest []string, stdio IO) error {
 		}
 		ctx, cancel := context.WithTimeout(context.Background(), timeoutFor(o, s))
 		start := time.Now()
-		sess, err := client.Connect(ctx, n, s, clientOptions(o, c, n))
-		err = loginHint(err, n, s)
+		var tools []*mcp.Tool
+		sess, err := connect(ctx, o, c, n, s)
 		if err == nil {
-			var tools []*mcp.Tool
-			tools, err = sess.ListTools(ctx)
+			tools, err = listTools(ctx, sess, c, n, s)
+			err = sess.loginHint(err)
 			sess.Close()
 			if err == nil {
-				p := policyOf(s)
-				allowed := 0
-				for _, t := range tools {
-					if p.Check(t.Name, readOnlyOf(t)).Allowed {
-						allowed++
-					}
-				}
-				fmt.Fprintf(stdio.Out, "  OK    %d tools, %d allowed (%s)\n", len(tools), allowed, time.Since(start).Round(time.Millisecond))
+				fmt.Fprintf(stdio.Out, "  OK    %d tools, %d allowed (%s)\n", len(tools), countAllowed(policyOf(s), tools), time.Since(start).Round(time.Millisecond))
 			}
 		}
 		cancel()

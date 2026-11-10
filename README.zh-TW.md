@@ -42,6 +42,16 @@ sluice add vercel              # 加入 OAuth 服務
 sluice login vercel            # 開瀏覽器登入一次，之後 token 自動更新
 ```
 
+### Linux、macOS、SSH 與 WSL
+
+三個平台的用法完全一樣，都是一個靜態執行檔，設定檔放在各平台的使用者設定目錄。
+`sluice login` 會自動開啟預設瀏覽器：macOS 用 `open`，Linux 桌面用 `xdg-open`，WSL 用 `wslview`。
+如果在沒有瀏覽器的機器上，例如 SSH 連線、container 或無介面的伺服器，sluice 會改成印出登入網址。
+你在任何一台電腦打開這個網址並完成登入後，瀏覽器會停在一個打不開的
+`http://127.0.0.1:…/callback?code=…` 頁面，把網址列上的這串網址整個複製，
+貼回正在等待的終端機即可。另一種做法是在 server 的 `auth` 區塊設定固定的
+`"redirect_port"`，再用 `ssh -L <port>:127.0.0.1:<port>` 把這個 port 轉發過去。
+
 ## 給 agent 的說明
 
 `sluice guide` 會印出完整的 agent 指南；`sluice agents-snippet` 會印出一小段說明，

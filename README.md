@@ -66,6 +66,18 @@ sluice add vercel
 sluice login vercel            # opens your browser once; tokens refresh automatically
 ```
 
+### Linux, macOS, SSH and WSL
+
+sluice behaves the same on Linux, macOS and Windows: one static binary, and the
+config lives in the platform's user config directory. `sluice login` opens the
+default browser with `open` (macOS), `xdg-open` (Linux desktop) or `wslview`
+(WSL). On a machine without a browser, such as an SSH session, a container or a
+headless server, it prints the sign-in URL instead. Open that URL on any
+machine and sign in. The browser then lands on a `http://127.0.0.1:…/callback?code=…`
+page that fails to load. Copy that address and paste it into the waiting
+terminal. Alternatively, set a fixed `"redirect_port"` in the server's `auth`
+block and forward it with `ssh -L <port>:127.0.0.1:<port>`.
+
 ## For agents
 
 ```bash

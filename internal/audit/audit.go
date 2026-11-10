@@ -133,11 +133,11 @@ func DetectAgent() string {
 		return "gemini-cli"
 	case os.Getenv("CURSOR_AGENT") != "" || os.Getenv("CURSOR_TRACE_ID") != "":
 		return "cursor"
-	}
-	for _, kv := range os.Environ() {
-		if strings.HasPrefix(kv, "CODEX_") {
-			return "codex"
-		}
+	// Variables Codex sets for the commands it runs (not CODEX_HOME, which
+	// users export in their shell profile).
+	case os.Getenv("CODEX_SANDBOX") != "" || os.Getenv("CODEX_SANDBOX_NETWORK_DISABLED") != "" ||
+		os.Getenv("CODEX_THREAD_ID") != "":
+		return "codex"
 	}
 	return ""
 }

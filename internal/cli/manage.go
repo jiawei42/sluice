@@ -18,6 +18,7 @@ import (
 	"github.com/jiawei42/sluice/internal/config"
 	"github.com/jiawei42/sluice/internal/oauth"
 	"github.com/jiawei42/sluice/internal/presets"
+	"github.com/jiawei42/sluice/internal/toolcache"
 )
 
 // ---- presets / add / remove ------------------------------------------------
@@ -118,6 +119,13 @@ func cmdAdd(o *opts, rest []string, stdio IO) error {
 	target := filepath.Join(c.ServersDir(), name+".jsonc")
 	if err := os.WriteFile(target, []byte(b.String()), 0o600); err != nil {
 		return err
+	}
+	// --force replacing servers.d/<name>.json: drop the old file, or the
+	// server would be defined twice.
+	if prev, exists := c.Servers[name]; exists && filepath.Clean(prev.Source) != filepath.Clean(target) {
+		if err := os.Remove(prev.Source); err != nil {
+			return fmt.Errorf("replace %s: %w", prev.Source, err)
+		}
 	}
 	fmt.Fprintf(stdio.Out, "added %q from preset %q → %s\n", name, p.Name, target)
 
@@ -221,7 +229,7 @@ func cmdLogin(o *opts, rest []string, stdio IO) error {
 	}
 	store := oauth.NewStore(c)
 	login, err := oauth.NewLogin(store, name, resolved, oauth.LoginOptions{
-		Out: stdio.Err, OpenBrowser: !o.noBrowser, Version: client.Version,
+		Out: stdio.Err, In: stdio.In, OpenBrowser: !o.noBrowser, Version: client.Version,
 	})
 	if err != nil {
 		return &ExitError{ExitConnect, err}
@@ -249,15 +257,9 @@ func cmdLogin(o *opts, rest []string, stdio IO) error {
 	if err != nil {
 		return asConnectErr(err)
 	}
-	p := policyOf(s)
-	allowed := 0
-	for _, t := range tools {
-		if p.Check(t.Name, readOnlyOf(t)).Allowed {
-			allowed++
-		}
-	}
+	toolcache.Save(c, name, s, tools)
 	fmt.Fprintf(stdio.Out, "logged in to %q: %d tools, %d allowed by the whitelist. Token stored in %s\n",
-		name, len(tools), allowed, store.Dir)
+		name, len(tools), countAllowed(policyOf(s), tools), store.Dir)
 	return nil
 }
 

@@ -54,3 +54,23 @@ func TestValidate(t *testing.T) {
 		t.Fatalf("inference failed: %v", err)
 	}
 }
+
+func TestDotEnvValue(t *testing.T) {
+	cases := map[string]string{
+		`abc`:                       "abc",
+		`abc # comment`:             "abc",
+		"abc\t# comment":            "abc",
+		`a#b`:                       "a#b",
+		`"quoted # kept" # comment`: "quoted # kept",
+		`'single'`:                  "single",
+		`  spaced  `:                "spaced",
+		`"unterminated`:             `"unterminated`,
+		``:                          "",
+		`# only a comment`:          "# only a comment",
+	}
+	for in, want := range cases {
+		if got := dotEnvValue(in); got != want {
+			t.Errorf("dotEnvValue(%q) = %q, want %q", in, got, want)
+		}
+	}
+}

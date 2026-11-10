@@ -23,6 +23,9 @@ jobs:
       - name: gofmt
         if: runner.os == 'Linux'
         run: test -z "$(gofmt -l .)" || (gofmt -l . && exit 1)
+      - name: go.mod is tidy
+        if: runner.os == 'Linux'
+        run: go mod tidy && git diff --exit-code -- go.mod go.sum
       - run: go vet ./...
       - run: go test -race ./...
         if: runner.os == 'Linux'

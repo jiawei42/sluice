@@ -25,6 +25,7 @@ whitelist the user controls and is written to an audit log.
 | `internal/oauth` | `sluice login` browser flow, token store, silent refresh, agent-safe handler |
 | `internal/audit` | JSONL call log, rotation, agent detection |
 | `internal/presets` | built-in server catalog with conservative whitelists |
+| `internal/toolcache` | per-server tool list on disk (24 h) so `call` can skip `tools/list` when safe |
 | `internal/fakeserver` | test MCP server; `go run ./internal/fakeserver/cmd [-http :8080]` |
 | `docs/agents` | agent docs + config templates, embedded into the binary with `go:embed` |
 | `install.sh`, `install.ps1`, `.goreleaser.yaml`, `.github/workflows` | distribution |
