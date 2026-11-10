@@ -61,14 +61,25 @@ var catalog = []Preset{
 		Name:        "vercel",
 		Description: "Vercel: projects, deployments, build logs, docs (OAuth)",
 		Docs:        "https://vercel.com/docs/mcp/vercel-mcp",
-		Notes:       []string{"Deploy tools are denied by default; add them to \"allow\" only if agents should deploy."},
+		Notes: []string{
+			"Read-only by default. Deploys, domain purchases and project changes are not allowed.",
+			"Tools that can return secrets (env var values, Edge Config tokens) are denied; allow them by exact name only if needed.",
+		},
 		Server: config.Server{
 			Description:   "Vercel: projects, deployments, build logs, docs",
 			URL:           "https://mcp.vercel.com/",
 			Auth:          oauth(),
 			Allow:         []string{"get_*", "list_*", "search_*"},
 			AllowReadOnly: true,
-			Deny:          []string{"deploy*", "*delete*"},
+			// Verified against Vercel's live tool list (246 tools):
+			// get_or_create_drive and get_access_to_vercel_url write despite
+			// their names; the env/token readers can return secret values.
+			Deny: []string{
+				"*delete*", "deploy*",
+				"get_or_create_*", "get_access_to_vercel_url",
+				"get_project_env", "filter_project_envs", "get_shared_env_var",
+				"*token*",
+			},
 		},
 	},
 	{
