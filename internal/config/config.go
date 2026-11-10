@@ -408,10 +408,7 @@ func LoadDotEnv(p string) error {
 			return fmt.Errorf("%s:%d: expected KEY=VALUE", p, n)
 		}
 		k = strings.TrimSpace(k)
-		v = strings.TrimSpace(v)
-		if len(v) >= 2 && (v[0] == '"' && v[len(v)-1] == '"' || v[0] == '\'' && v[len(v)-1] == '\'') {
-			v = v[1 : len(v)-1]
-		}
+		v = dotEnvValue(v)
 		if v == "" {
 			continue // placeholder written by `sluice add`, not a value
 		}
@@ -420,6 +417,25 @@ func LoadDotEnv(p string) error {
 		}
 	}
 	return sc.Err()
+}
+
+// dotEnvValue parses the right-hand side of a .env line: a quoted value keeps
+// everything between the quotes (anything after the closing quote is
+// ignored); an unquoted value ends at " #" (an inline comment).
+func dotEnvValue(v string) string {
+	v = strings.TrimSpace(v)
+	if len(v) > 0 && (v[0] == '"' || v[0] == '\'') {
+		if end := strings.IndexByte(v[1:], v[0]); end >= 0 {
+			return v[1 : end+1]
+		}
+		return v // unterminated quote: keep as written
+	}
+	if i := strings.Index(v, " #"); i >= 0 {
+		v = v[:i]
+	} else if i := strings.Index(v, "\t#"); i >= 0 {
+		v = v[:i]
+	}
+	return strings.TrimSpace(v)
 }
 
 // StripJSONComments removes // and /* */ comments outside of strings, so the

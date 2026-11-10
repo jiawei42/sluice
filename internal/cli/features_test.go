@@ -165,10 +165,14 @@ type fakeOAuth struct {
 	n         atomic.Int32
 	refreshes atomic.Int32
 	expiresIn int
+	// refresh tokens rotate: each is valid once, like Linear or Notion.
+	refreshOK map[string]bool
+	tokenDown atomic.Bool // token endpoint answers 500
+	forbid    atomic.Bool // MCP endpoint answers a plain 403 to valid tokens
 }
 
 func newFakeOAuth(t *testing.T) *fakeOAuth {
-	f := &fakeOAuth{valid: map[string]bool{}, expiresIn: 3600}
+	f := &fakeOAuth{valid: map[string]bool{}, refreshOK: map[string]bool{}, expiresIn: 3600}
 	mux := http.NewServeMux()
 	f.srv = httptest.NewServer(mux)
 	t.Cleanup(f.srv.Close)
@@ -208,6 +212,10 @@ func newFakeOAuth(t *testing.T) *fakeOAuth {
 	})
 	mux.HandleFunc("/token", func(w http.ResponseWriter, r *http.Request) {
 		r.ParseForm()
+		if f.tokenDown.Load() {
+			http.Error(w, "upstream outage", http.StatusInternalServerError)
+			return
+		}
 		switch r.Form.Get("grant_type") {
 		case "authorization_code":
 			if r.Form.Get("code") != "the-code" || r.Form.Get("code_verifier") == "" {
@@ -215,7 +223,11 @@ func newFakeOAuth(t *testing.T) *fakeOAuth {
 				return
 			}
 		case "refresh_token":
-			if r.Form.Get("refresh_token") != "the-refresh" {
+			f.mu.Lock()
+			ok := f.refreshOK[r.Form.Get("refresh_token")]
+			delete(f.refreshOK, r.Form.Get("refresh_token")) // single use
+			f.mu.Unlock()
+			if !ok {
 				writeJSON(w, 400, map[string]string{"error": "invalid_grant"})
 				return
 			}
@@ -224,11 +236,13 @@ func newFakeOAuth(t *testing.T) *fakeOAuth {
 			writeJSON(w, 400, map[string]string{"error": "unsupported_grant_type"})
 			return
 		}
-		tok := fmt.Sprintf("tok-%d", f.n.Add(1))
+		n := f.n.Add(1)
+		tok, refresh := fmt.Sprintf("tok-%d", n), fmt.Sprintf("refresh-%d", n)
 		f.mu.Lock()
 		f.valid[tok] = true
+		f.refreshOK[refresh] = true
 		f.mu.Unlock()
-		writeJSON(w, 200, map[string]any{"access_token": tok, "token_type": "Bearer", "expires_in": f.expiresIn, "refresh_token": "the-refresh"})
+		writeJSON(w, 200, map[string]any{"access_token": tok, "token_type": "Bearer", "expires_in": f.expiresIn, "refresh_token": refresh})
 	})
 	mcpHandler := mcp.NewStreamableHTTPHandler(func(*http.Request) *mcp.Server { return fakeserver.New() }, nil)
 	mux.HandleFunc("/mcp", func(w http.ResponseWriter, r *http.Request) {
@@ -239,6 +253,10 @@ func newFakeOAuth(t *testing.T) *fakeOAuth {
 		if !ok {
 			w.Header().Set("WWW-Authenticate", fmt.Sprintf(`Bearer resource_metadata="%s/.well-known/oauth-protected-resource/mcp"`, base()))
 			http.Error(w, "unauthorized", http.StatusUnauthorized)
+			return
+		}
+		if f.forbid.Load() {
+			http.Error(w, "no access to this workspace", http.StatusForbidden)
 			return
 		}
 		mcpHandler.ServeHTTP(w, r)
