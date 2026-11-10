@@ -145,7 +145,7 @@ func cmdAdd(o *opts, rest []string, stdio IO) error {
 	for _, n := range p.Notes {
 		fmt.Fprintf(stdio.Out, "  note: %s\n", n)
 	}
-	if srv.IsOAuth() {
+	if srv.IsOAuth() && !oauth.NewStore(c).Status(name, mustResolvedURL(&srv)).Usable() {
 		fmt.Fprintf(stdio.Out, "next: sluice login %s   (opens your browser)\n", name)
 	} else {
 		fmt.Fprintf(stdio.Out, "next: sluice doctor %s, then review the whitelist with sluice policy %s\n", name, name)
