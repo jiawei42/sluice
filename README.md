@@ -66,6 +66,22 @@ sluice add vercel
 sluice login vercel            # opens your browser once; tokens refresh automatically
 ```
 
+Your own MCP servers (an internal tool server, a database reader, ...) start
+with an empty whitelist. Secrets can only be passed as environment variable
+names, so no value is written into the server file:
+
+```bash
+# stdio: everything after -- is the command; --env passes ${env:VAR} (CHILD=VAR renames it)
+sluice add internal --env MONGO_URI=INTERNAL_MONGO_URI --env JIRA_API_TOKEN -- /opt/tools/local-mcp
+# HTTP: --bearer VAR or --header-env Header=VAR, or --oauth for servers that support it
+sluice add team --url https://mcp.example.com/mcp --header-env X-Jira-Api-Token=JIRA_API_TOKEN
+sluice policy internal         # see its tools, then list the safe ones in "allow" (or pass --allow)
+```
+
+`sluice doctor` warns when a server file holds something that looks like a
+secret (a password in a connection string, a token, an `Authorization`
+value) instead of a `${env:VAR}` reference. It names the field, never the value.
+
 ### Linux, macOS, SSH and WSL
 
 sluice behaves the same on Linux, macOS and Windows: one static binary, and the

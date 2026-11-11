@@ -35,6 +35,14 @@ First public release (the project was called `mcpx` during development).
 - Tool-list cache (`cache/`, 24 h): `call` skips the extra `tools/list` round
   trip when the tool doesn't mirror arguments into HTTP headers, and never
   lists for stdio servers unless `allow_readonly` needs annotations.
+- Custom servers from the CLI: `sluice add <name> -- <command> [args]` (stdio)
+  and `sluice add <name> --url URL [--oauth]` (HTTP). They start with an empty
+  whitelist (`--allow`/`--deny` to set one), and credentials are passed only as
+  environment variable names (`--env`, `--bearer`, `--header-env`), so no
+  secret value is written to `servers.d/`.
+- `sluice doctor` warns when a server file holds a literal secret (password in
+  a connection string, token, `Authorization` value) instead of `${env:VAR}`.
+  It names the field, never the value.
 
 ### Fixed during review
 - Token refresh is serialized across processes with a lock file, so parallel

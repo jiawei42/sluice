@@ -42,6 +42,20 @@ sluice add vercel              # 加入 OAuth 服務
 sluice login vercel            # 開瀏覽器登入一次，之後 token 自動更新
 ```
 
+自己的 MCP server（公司內部的工具 server、資料庫查詢等）一加入時白名單是空的。
+機密只能用環境變數名稱傳入，所以設定檔裡不會寫進任何密碼或 token：
+
+```bash
+# stdio：-- 後面是啟動指令；--env 會傳入 ${env:VAR}，CHILD=VAR 可以改名
+sluice add internal --env MONGO_URI=INTERNAL_MONGO_URI --env JIRA_API_TOKEN -- /opt/tools/local-mcp
+# HTTP：用 --bearer VAR 或 --header-env Header=VAR，支援 OAuth 的 server 用 --oauth
+sluice add team --url https://mcp.example.com/mcp --header-env X-Jira-Api-Token=JIRA_API_TOKEN
+sluice policy internal         # 先看有哪些 tool，再把安全的寫進 "allow"（或加 --allow）
+```
+
+如果 server 設定檔裡出現像是機密的值（連線字串裡的密碼、token、`Authorization`），
+而不是 `${env:VAR}`，`sluice doctor` 會發出警告。警告只會指出欄位，不會印出值。
+
 ### Linux、macOS、SSH 與 WSL
 
 三個平台的用法完全一樣，都是一個靜態執行檔，設定檔放在各平台的使用者設定目錄。

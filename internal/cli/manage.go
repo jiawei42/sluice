@@ -5,8 +5,10 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"net/url"
 	"os"
 	"path/filepath"
+	"regexp"
 	"strings"
 	"text/tabwriter"
 	"time"
@@ -68,16 +70,52 @@ func authKind(p presets.Preset) string {
 }
 
 func cmdAdd(o *opts, rest []string, stdio IO) error {
-	if len(rest) != 1 {
-		return fail(ExitUsage, "usage: sluice add <preset> [--name NAME] [--force]  (see `sluice presets`)")
-	}
-	p, ok := presets.Get(rest[0])
-	if !ok {
-		return fail(ExitUsage, "unknown preset %q (see `sluice presets`)", rest[0])
-	}
-	name := o.name
-	if name == "" {
-		name = p.Name
+	var (
+		name   string
+		origin string // what the file header says created it
+		srv    config.Server
+		about  []string // extra header comment lines
+		envs   []presets.EnvVar
+		notes  []string
+	)
+	if o.dash || o.url != "" {
+		var err error
+		if name, srv, envs, err = customServer(o, rest); err != nil {
+			return err
+		}
+		origin = "custom server"
+		about = []string{`Your own MCP server. Nothing is allowed until tool names or globs are in "allow".`}
+		if len(srv.Allow) == 0 {
+			notes = append(notes, "nothing is allowed yet: run `sluice policy "+name+"` to see its tools, then add the ones agents may use to \"allow\"")
+		}
+	} else {
+		if len(rest) != 1 {
+			return fail(ExitUsage, "usage: sluice add <preset> [--name NAME] [--force]  (see `sluice presets`)\n"+
+				"   or: sluice add <name> -- <command> [args...]   (your own stdio server)\n"+
+				"   or: sluice add <name> --url URL [--oauth]     (your own HTTP server)")
+		}
+		if o.oauth || o.bearer != "" || len(o.envs) > 0 || len(o.headerEnvs) > 0 || len(o.allow) > 0 || len(o.deny) > 0 {
+			return fail(ExitUsage, "--env, --bearer, --header-env, --oauth, --allow and --deny are for custom servers (with -- <command> or --url); edit a preset's file after adding it")
+		}
+		p, ok := presets.Get(rest[0])
+		if !ok {
+			return fail(ExitUsage, "unknown preset %q (see `sluice presets`; for your own server use `sluice add <name> -- <command>` or `--url URL`)", rest[0])
+		}
+		name = o.name
+		if name == "" {
+			name = p.Name
+		}
+		origin = "preset " + p.Name
+		srv = p.Server
+		srv.Preset = p.Name
+		about = append(about, p.Description, "Docs: "+p.Docs)
+		for _, e := range p.Env {
+			about = append(about, fmt.Sprintf("Needs %s: %s", e.Name, e.Help))
+		}
+		for _, n := range p.Notes {
+			about = append(about, "Note: "+n)
+		}
+		envs, notes = p.Env, p.Notes
 	}
 	if !config.ValidName(name) {
 		return fail(ExitUsage, "bad server name %q: use letters, digits, '-' or '_'", name)
@@ -93,23 +131,18 @@ func cmdAdd(o *opts, rest []string, stdio IO) error {
 		return fail(ExitUsage, "server %q already exists (%s); use --name to add another, or --force to replace it", name, prev.Source)
 	}
 
-	srv := p.Server
-	srv.Preset = p.Name
 	body, err := json.MarshalIndent(&srv, "", "  ")
 	if err != nil {
 		return err
 	}
 	var b strings.Builder
-	fmt.Fprintf(&b, "// %s — added by `sluice add %s`\n", name, p.Name)
-	fmt.Fprintf(&b, "// %s\n// Docs: %s\n", p.Description, p.Docs)
-	for _, e := range p.Env {
-		fmt.Fprintf(&b, "// Needs %s: %s\n", e.Name, e.Help)
-	}
-	for _, n := range p.Notes {
-		fmt.Fprintf(&b, "// Note: %s\n", n)
+	fmt.Fprintf(&b, "// %s — added by `sluice add` (%s)\n", name, origin)
+	for _, line := range about {
+		fmt.Fprintf(&b, "// %s\n", line)
 	}
 	b.WriteString("//\n// Whitelist: \"allow\" globs may be called, \"deny\" always wins, \"allow_readonly\" also\n")
 	fmt.Fprintf(&b, "// admits tools the server marks read-only. Review with: sluice policy %s\n", name)
+	b.WriteString("// Secrets: never write them here. Use ${env:VAR} and put the value in .env next to config.json.\n")
 	b.Write(body)
 	b.WriteByte('\n')
 
@@ -127,10 +160,14 @@ func cmdAdd(o *opts, rest []string, stdio IO) error {
 			return fmt.Errorf("replace %s: %w", prev.Source, err)
 		}
 	}
-	fmt.Fprintf(stdio.Out, "added %q from preset %q → %s\n", name, p.Name, target)
+	if srv.Preset != "" {
+		fmt.Fprintf(stdio.Out, "added %q from preset %q → %s\n", name, srv.Preset, target)
+	} else {
+		fmt.Fprintf(stdio.Out, "added %q (%s) → %s\n", name, origin, target)
+	}
 
 	envPath := filepath.Join(c.Dir(), ".env")
-	for _, e := range p.Env {
+	for _, e := range envs {
 		if os.Getenv(e.Name) != "" {
 			continue
 		}
@@ -142,15 +179,128 @@ func cmdAdd(o *opts, rest []string, stdio IO) error {
 			fmt.Fprintf(stdio.Out, "  %s is still empty in %s\n", e.Name, envPath)
 		}
 	}
-	for _, n := range p.Notes {
+	for _, n := range notes {
 		fmt.Fprintf(stdio.Out, "  note: %s\n", n)
 	}
-	if srv.IsOAuth() && !oauth.NewStore(c).Status(name, mustResolvedURL(&srv)).Usable() {
+	for _, loc := range config.LiteralSecrets(&srv) {
+		fmt.Fprintf(stdio.Out, "  warning: %s looks like a secret in plain text; move the value to %s and use ${env:VAR}\n", loc, envPath)
+	}
+	switch {
+	case srv.IsOAuth() && !oauth.NewStore(c).Status(name, mustResolvedURL(&srv)).Usable():
 		fmt.Fprintf(stdio.Out, "next: sluice login %s   (opens your browser)\n", name)
-	} else {
+	case len(srv.Allow) == 0 && !srv.AllowReadOnly:
+		fmt.Fprintf(stdio.Out, "next: sluice policy %s, then edit \"allow\" in %s\n", name, target)
+	default:
 		fmt.Fprintf(stdio.Out, "next: sluice doctor %s, then review the whitelist with sluice policy %s\n", name, name)
 	}
 	return nil
+}
+
+var envNameRe = regexp.MustCompile(`^[A-Za-z_][A-Za-z0-9_]*$`)
+
+// customServer builds a server from `sluice add <name> -- <command> [args]`
+// (stdio) or `sluice add <name> --url URL` (http). Credentials can only be
+// given as environment variable names, so no secret value is written.
+func customServer(o *opts, rest []string) (string, config.Server, []presets.EnvVar, error) {
+	srv := config.Server{Description: "Custom server added with `sluice add`"}
+	bad := func(format string, a ...any) (string, config.Server, []presets.EnvVar, error) {
+		return "", srv, nil, fail(ExitUsage, format, a...)
+	}
+	if o.name != "" {
+		return bad("for a custom server the name is the first argument: sluice add <name> -- <command>")
+	}
+	if o.dash && o.url != "" {
+		return bad("use either -- <command> (stdio) or --url URL (http), not both")
+	}
+	if len(rest) == 0 || len(rest) != 1+len(o.dashArgs) {
+		return bad("usage: sluice add <name> -- <command> [args...]   or   sluice add <name> --url URL [--oauth]")
+	}
+	name := rest[0]
+
+	var envs []presets.EnvVar
+	needEnv := func(v string) error {
+		if !envNameRe.MatchString(v) {
+			return fail(ExitUsage, "bad environment variable name %q", v)
+		}
+		for _, e := range envs {
+			if e.Name == v {
+				return nil
+			}
+		}
+		envs = append(envs, presets.EnvVar{Name: v, Help: "used by the " + name + " server; put the value here, never in servers.d"})
+		return nil
+	}
+	ref := func(v string) string { return "${env:" + v + "}" }
+
+	if o.dash {
+		if len(o.dashArgs) == 0 {
+			return bad("missing the command after --")
+		}
+		if o.oauth || o.bearer != "" || len(o.headerEnvs) > 0 {
+			return bad("--oauth, --bearer and --header-env are for --url servers; use --env for a stdio server")
+		}
+		srv.Transport = "stdio"
+		srv.Command = o.dashArgs[0]
+		srv.Args = o.dashArgs[1:]
+		for _, e := range o.envs {
+			child, src, ok := strings.Cut(e, "=")
+			if !ok {
+				src = child
+			}
+			if !envNameRe.MatchString(child) {
+				return bad("--env expects VAR or CHILD=VAR, got %q", e)
+			}
+			if err := needEnv(src); err != nil {
+				return "", srv, nil, err
+			}
+			if srv.Env == nil {
+				srv.Env = map[string]string{}
+			}
+			srv.Env[child] = ref(src)
+		}
+	} else {
+		if len(o.envs) > 0 {
+			return bad("--env is for stdio servers; for --url servers use --bearer VAR or --header-env Name=VAR")
+		}
+		u, err := url.Parse(o.url)
+		if err != nil || (u.Scheme != "http" && u.Scheme != "https") || u.Host == "" {
+			return bad("--url must be an http(s) URL")
+		}
+		if u.User != nil || u.RawQuery != "" {
+			return bad("--url must not contain credentials or a query string; pass secrets with --bearer or --header-env")
+		}
+		if o.oauth && o.bearer != "" {
+			return bad("use either --oauth or --bearer, not both")
+		}
+		srv.Transport = "http"
+		srv.URL = o.url
+		if o.oauth {
+			srv.Auth = &config.Auth{Type: "oauth"}
+		}
+		if o.bearer != "" {
+			if err := needEnv(o.bearer); err != nil {
+				return "", srv, nil, err
+			}
+			srv.Headers = map[string]string{"Authorization": "Bearer " + ref(o.bearer)}
+		}
+		for _, h := range o.headerEnvs {
+			k, v, ok := strings.Cut(h, "=")
+			k = strings.TrimSpace(k)
+			if !ok || k == "" {
+				return bad("--header-env expects Name=VAR, got %q", h)
+			}
+			if err := needEnv(v); err != nil {
+				return "", srv, nil, err
+			}
+			if srv.Headers == nil {
+				srv.Headers = map[string]string{}
+			}
+			srv.Headers[k] = ref(v)
+		}
+	}
+	srv.Allow = append([]string{}, o.allow...)
+	srv.Deny = o.deny
+	return name, srv, envs, nil
 }
 
 func isInServersDir(c *config.Config, s *config.Server) bool {
