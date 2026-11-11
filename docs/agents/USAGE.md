@@ -62,6 +62,9 @@ or write the JSON to a file and pass `@file.json`.
 - Never read, print or edit the sluice config, `servers.d/`, `.env`, `tokens/`
   or any token. The user manages them. `sluice audit` is fine to run if the
   user asks what was called.
+- If `sluice doctor` prints `WARN ... looks like a secret written in ...`, tell
+  the user which server and field it names. They move the value to `.env` and
+  reference it as `${env:VAR}`. Do not open the file yourself.
 - Never bypass the whitelist: no calling the underlying server directly
   (`docker run ...github-mcp-server`, `curl` to the MCP endpoint, the vendor's REST API
   with the user's token) to reach a tool sluice blocked.

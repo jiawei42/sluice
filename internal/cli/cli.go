@@ -54,6 +54,17 @@ type opts struct {
 	force     bool   // add --force
 	noBrowser bool   // login --no-browser
 
+	// add, custom servers
+	dash       bool     // "--" was given
+	dashArgs   []string // everything after "--" (command and args)
+	url        string   // --url
+	oauth      bool     // --oauth
+	envs       []string // --env VAR or CHILD=VAR
+	bearer     string   // --bearer VAR
+	headerEnvs []string // --header-env Name=VAR
+	allow      []string // --allow PATTERN
+	deny       []string // --deny PATTERN
+
 	since        time.Duration // audit --since
 	serverFilter string        // audit --server
 	deniedOnly   bool          // audit --denied
@@ -77,6 +88,8 @@ Setup (for humans):
   sluice init [preset...]                create the config (optionally adding presets)
   sluice presets                         list ready-made servers (GitHub, Vercel, Linear, ...)
   sluice add <preset> [--name N]         add a server with a safe default whitelist
+  sluice add <name> -- <command> [args]  add your own stdio server (nothing allowed until you allow it)
+  sluice add <name> --url URL [--oauth]  add your own HTTP server
   sluice remove <server>                 remove a server added with ` + "`add`" + `
   sluice login <server>                  sign in to an OAuth server in your browser
   sluice logout <server>                 delete the stored OAuth token
@@ -94,6 +107,10 @@ Flags:
       --raw              call: print the full MCP CallToolResult as JSON
       --timeout 90s      override the server timeout
       --config PATH      config file (default: $SLUICE_CONFIG or the user config dir)
+      --env VAR          add (stdio): pass ${env:VAR} to the server; CHILD=VAR renames it
+      --bearer VAR       add (http): send "Authorization: Bearer ${env:VAR}"
+      --header-env H=VAR add (http): send header H with the value of VAR
+      --allow / --deny P add (custom): whitelist glob, repeatable
       --since 24h        audit: only newer entries      --server NAME   audit: one server
       --denied           audit: only denied calls       --limit N       audit: last N (default 50, -1 all)
   -v, --verbose          show server stderr
@@ -180,6 +197,7 @@ func parseFlags(args []string) (*opts, []string, error) {
 	for i := 0; i < len(args); i++ {
 		a := args[i]
 		if a == "--" {
+			o.dash, o.dashArgs = true, args[i+1:]
 			pos = append(pos, args[i+1:]...)
 			break
 		}
@@ -248,6 +266,27 @@ func parseFlags(args []string) (*opts, []string, error) {
 			o.noBrowser = true
 		case "--denied":
 			o.deniedOnly = true
+		case "--oauth":
+			o.oauth = true
+		case "--url", "--env", "--bearer", "--header-env", "--allow", "--deny":
+			v, err := needVal()
+			if err != nil {
+				return nil, nil, err
+			}
+			switch name {
+			case "--url":
+				o.url = v
+			case "--env":
+				o.envs = append(o.envs, v)
+			case "--bearer":
+				o.bearer = v
+			case "--header-env":
+				o.headerEnvs = append(o.headerEnvs, v)
+			case "--allow":
+				o.allow = append(o.allow, v)
+			case "--deny":
+				o.deny = append(o.deny, v)
+			}
 		case "--out", "--name", "--server", "--since", "--max-output", "--limit":
 			v, err := needVal()
 			if err != nil {

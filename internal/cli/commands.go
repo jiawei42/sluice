@@ -615,6 +615,10 @@ func cmdDoctor(o *opts, rest []string, stdio IO) error {
 	for _, n := range names {
 		s := c.Servers[n]
 		fmt.Fprintf(stdio.Out, "\n[%s] %s\n", n, s.Transport)
+		for _, loc := range config.LiteralSecrets(s) {
+			fmt.Fprintf(stdio.Out, "  WARN  %s looks like a secret written in %s; move the value to %s and use ${env:VAR}\n",
+				loc, s.Source, filepath.Join(filepath.Dir(c.Path), ".env"))
+		}
 		missing := false
 		for _, v := range s.EnvRefs() {
 			state := "set"
